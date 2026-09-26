@@ -8,13 +8,17 @@ import (
 	"connectrpc.com/connect"
 
 	"payment-ledger/gen/ledger/v1/ledgerv1connect"
+	"payment-ledger/internal/ledger"
 )
 
 // Service implements LedgerService. RPCs that aren't built yet return
 // Unimplemented through the embedded handler.
 type Service struct {
 	ledgerv1connect.UnimplementedLedgerServiceHandler
+	ledger *ledger.Ledger
 }
+
+func NewService(l *ledger.Ledger) *Service { return &Service{ledger: l} }
 
 // NewHandler mounts svc behind the auth interceptor. The handler serves gRPC,
 // gRPC-Web, and Connect HTTP/JSON.

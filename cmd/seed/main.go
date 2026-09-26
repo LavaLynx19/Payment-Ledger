@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"payment-ledger/internal/env"
 	"payment-ledger/internal/store"
 )
 
@@ -24,13 +25,8 @@ func main() {
 	wallets := flag.Int("wallets", 100, "number of Wallets to create")
 	flag.Parse()
 
-	dsn := os.Getenv("DATABASE_URL")
-	if dsn == "" {
-		log.Fatal("DATABASE_URL is not set")
-	}
-
 	ctx := context.Background()
-	db, err := store.Open(ctx, dsn)
+	db, err := store.Open(ctx, env.Must("DATABASE_URL"))
 	if err != nil {
 		log.Fatalf("seed: %v", err)
 	}

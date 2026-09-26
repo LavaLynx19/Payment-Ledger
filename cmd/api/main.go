@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"payment-ledger/internal/api"
+	"payment-ledger/internal/env"
+	"payment-ledger/internal/ledger"
 	"payment-ledger/internal/store"
 )
 
@@ -35,11 +37,27 @@ func main() {
 }
 
 func runServe() {
-	tokens := api.ParseTokens(mustEnv("LEDGER_SERVICE_TOKENS"))
+	tokens := api.ParseTokens(env.Must("LEDGER_SERVICE_TOKENS"))
 	if len(tokens) == 0 {
 		log.Fatal("LEDGER_SERVICE_TOKENS has no tokens")
 	}
-	addr := envOr("LISTEN_ADDR", ":8080")
+	addr := env.Or("LISTEN_ADDR", ":8080")
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	db, err := store.Open(ctx, env.Must("DATABASE_URL"))
+	if err != nil {
+		log.Fatalf("api: %v", err)
+	}
+	defer db.Close()
+	l, err := ledger.New(ctx, db, ledger.Config{
+		HoldTTL:     env.Duration("HOLD_TTL", 30*time.Second),
+		CASAttempts: env.Int("CAS_ATTEMPTS", 10),
+	})
+	if err != nil {
+		log.Fatalf("api: %v", err)
+	}
 
 	// HTTP/1.1 for Connect JSON clients, plaintext HTTP/2 (h2c) for gRPC clients like k6.
 	protocols := new(http.Protocols)
@@ -48,13 +66,10 @@ func runServe() {
 
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           api.NewHandler(&api.Service{}, tokens),
+		Handler:           api.NewHandler(api.NewService(l), tokens),
 		Protocols:         protocols,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -69,7 +84,7 @@ func runServe() {
 }
 
 func runMigrate() {
-	results, err := store.Migrate(context.Background(), mustEnv("DATABASE_URL"))
+	results, err := store.Migrate(context.Background(), env.Must("DATABASE_URL"))
 	if err != nil {
 		log.Fatalf("migrate: %v", err)
 	}
@@ -79,19 +94,4 @@ func runMigrate() {
 	for _, r := range results {
 		log.Printf("migrate: applied %s in %s", r.Source.Path, r.Duration)
 	}
-}
-
-func mustEnv(name string) string {
-	v := os.Getenv(name)
-	if v == "" {
-		log.Fatalf("%s is not set", name)
-	}
-	return v
-}
-
-func envOr(name, fallback string) string {
-	if v := os.Getenv(name); v != "" {
-		return v
-	}
-	return fallback
 }

@@ -1,13 +1,16 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"connectrpc.com/connect"
 
 	ledgerv1 "payment-ledger/gen/ledger/v1"
+	"payment-ledger/internal/ledger"
 )
 
 // Constructors for the A§7 error table. Each error carries a Connect code, an
@@ -48,9 +51,46 @@ func ErrNotFound(resource, id string) *connect.Error {
 		fmt.Sprintf("No %s found with id %s.", resource, id))
 }
 
+// ErrInvalidRequest takes a message that names the field and the rule it
+// broke, e.g. "amount must be greater than 0."
+func ErrInvalidRequest(msg string) *connect.Error {
+	return newError(connect.CodeInvalidArgument, ledgerv1.ErrorDetail_REASON_INVALID_REQUEST, msg)
+}
+
 func ErrUnauthenticated() *connect.Error {
 	return newError(connect.CodeUnauthenticated, ledgerv1.ErrorDetail_REASON_UNAUTHENTICATED,
 		"Missing or invalid service token.")
+}
+
+// toConnect maps a domain error to its A§7 error. Anything unrecognized is
+// logged and returned as a generic internal error, so no internals leak.
+func toConnect(err error) error {
+	var (
+		cerr         *connect.Error
+		insufficient *ledger.InsufficientFundsError
+		notFound     *ledger.NotFoundError
+		inv          *ledger.InvalidError
+	)
+	switch {
+	case errors.As(err, &cerr):
+		return cerr
+	case errors.As(err, &insufficient):
+		return ErrInsufficientFunds(insufficient.Available, insufficient.Amount)
+	case errors.As(err, &notFound):
+		return ErrNotFound(notFound.Resource, notFound.ID)
+	case errors.As(err, &inv):
+		return ErrInvalidRequest(inv.Msg)
+	case errors.Is(err, ledger.ErrIdempotencyMismatch):
+		return ErrIdempotencyMismatch()
+	case errors.Is(err, ledger.ErrRetriesExhausted):
+		return ErrConflictRetriesExhausted()
+	case errors.Is(err, context.Canceled):
+		return connect.NewError(connect.CodeCanceled, err)
+	case errors.Is(err, context.DeadlineExceeded):
+		return connect.NewError(connect.CodeDeadlineExceeded, err)
+	}
+	log.Printf("api: internal error: %v", err)
+	return connect.NewError(connect.CodeInternal, errors.New("internal error"))
 }
 
 func newError(code connect.Code, reason ledgerv1.ErrorDetail_Reason, msg string) *connect.Error {
