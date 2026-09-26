@@ -1,0 +1,250 @@
+syntax = "proto3";
+
+package ledger.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "payment-ledger/gen/ledger/v1;ledgerv1";
+
+// LedgerService is the A§7 contract. Every mutating RPC requires an
+// Idempotency-Key header. Every RPC requires a service bearer token.
+service LedgerService {
+  rpc CreateTransfer(CreateTransferRequest) returns (CreateTransferResponse);
+  rpc GetTransfer(GetTransferRequest) returns (GetTransferResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  rpc PlaceHold(PlaceHoldRequest) returns (PlaceHoldResponse);
+  rpc CaptureHold(CaptureHoldRequest) returns (CaptureHoldResponse);
+  rpc ReleaseHold(ReleaseHoldRequest) returns (ReleaseHoldResponse);
+  rpc ReverseTransfer(ReverseTransferRequest) returns (ReverseTransferResponse);
+  rpc Repay(RepayRequest) returns (RepayResponse);
+  rpc TopUp(TopUpRequest) returns (TopUpResponse);
+  rpc Withdraw(WithdrawRequest) returns (WithdrawResponse);
+  rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  rpc GetBalanceAt(GetBalanceAtRequest) returns (GetBalanceAtResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  rpc ListEntries(ListEntriesRequest) returns (ListEntriesResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+  rpc ListReceivables(ListReceivablesRequest) returns (ListReceivablesResponse) {
+    option idempotency_level = NO_SIDE_EFFECTS;
+  }
+}
+
+// ---- Resources ----
+
+enum TransferType {
+  TRANSFER_TYPE_UNSPECIFIED = 0;
+  TRANSFER_TYPE_P2P = 1;
+  TRANSFER_TYPE_TOPUP = 2;
+  TRANSFER_TYPE_WITHDRAWAL = 3;
+  TRANSFER_TYPE_REVERSAL = 4;
+  TRANSFER_TYPE_REPAYMENT = 5;
+  TRANSFER_TYPE_RECEIVABLE = 6;
+}
+
+enum TransferStatus {
+  TRANSFER_STATUS_UNSPECIFIED = 0;
+  TRANSFER_STATUS_PENDING = 1;
+  TRANSFER_STATUS_POSTED = 2;
+  TRANSFER_STATUS_FAILED = 3;
+}
+
+enum HoldStatus {
+  HOLD_STATUS_UNSPECIFIED = 0;
+  HOLD_STATUS_ACTIVE = 1;
+  HOLD_STATUS_CAPTURED = 2;
+  HOLD_STATUS_RELEASED = 3;
+  HOLD_STATUS_EXPIRED = 4;
+}
+
+enum Direction {
+  DIRECTION_UNSPECIFIED = 0;
+  DIRECTION_DEBIT = 1;
+  DIRECTION_CREDIT = 2;
+}
+
+// Amounts are int64 minor units. IDs are UUIDv7 strings.
+message Transfer {
+  string id = 1;
+  TransferType type = 2;
+  string source_id = 3;
+  string dest_id = 4;
+  int64 amount = 5;
+  TransferStatus status = 6;
+  optional string reverses_id = 7;
+  google.protobuf.Timestamp created_at = 8;
+  google.protobuf.Timestamp posted_at = 9;
+}
+
+message Hold {
+  string id = 1;
+  string transfer_id = 2;
+  string source_id = 3;
+  string dest_id = 4;
+  int64 amount = 5;
+  optional int64 captured_amount = 6;
+  // Unset means the Hold never expires (system-initiated).
+  google.protobuf.Timestamp expires_at = 7;
+  HoldStatus status = 8;
+}
+
+message Entry {
+  string id = 1;
+  string transfer_id = 2;
+  string account_id = 3;
+  Direction direction = 4;
+  int64 amount = 5;
+  int64 balance_after = 6;
+  int64 account_version = 7;
+  google.protobuf.Timestamp created_at = 8;
+}
+
+message Receivable {
+  string debtor_wallet_id = 1;
+  string receivable_account_id = 2;
+  int64 owed = 3;
+  google.protobuf.Timestamp opened_at = 4;
+}
+
+// ErrorDetail is attached to every error with a domain reason (A§7).
+message ErrorDetail {
+  enum Reason {
+    REASON_UNSPECIFIED = 0;
+    REASON_INSUFFICIENT_FUNDS = 1;
+    REASON_RECEIVABLE_OPEN = 2;
+    REASON_HOLD_EXPIRED = 3;
+    REASON_HOLD_NOT_ACTIVE = 4;
+    REASON_IDEMPOTENCY_MISMATCH = 5;
+    REASON_CONFLICT_RETRIES_EXHAUSTED = 6;
+    REASON_NOT_FOUND = 7;
+    REASON_UNAUTHENTICATED = 8;
+  }
+  Reason reason = 1;
+}
+
+// ---- Requests / responses ----
+
+message CreateTransferRequest {
+  string source_id = 1;
+  string dest_id = 2;
+  int64 amount = 3;
+  // Defaults to the server's Hold TTL when unset.
+  google.protobuf.Duration hold_ttl = 4;
+}
+message CreateTransferResponse {
+  Transfer transfer = 1;
+}
+
+message GetTransferRequest {
+  string id = 1;
+}
+message GetTransferResponse {
+  Transfer transfer = 1;
+}
+
+message PlaceHoldRequest {
+  string source_id = 1;
+  string dest_id = 2;
+  int64 amount = 3;
+  google.protobuf.Duration ttl = 4;
+}
+message PlaceHoldResponse {
+  Hold hold = 1;
+  Transfer transfer = 2;
+}
+
+message CaptureHoldRequest {
+  string hold_id = 1;
+  // Unset captures the full Hold. Less than the Hold captures partially and
+  // releases the remainder.
+  optional int64 amount = 2;
+}
+message CaptureHoldResponse {
+  Hold hold = 1;
+  Transfer transfer = 2;
+}
+
+message ReleaseHoldRequest {
+  string hold_id = 1;
+}
+message ReleaseHoldResponse {
+  Hold hold = 1;
+}
+
+message ReverseTransferRequest {
+  string transfer_id = 1;
+}
+message ReverseTransferResponse {
+  Transfer reversal = 1;
+  // Set only when the recipient could not cover the full amount.
+  Transfer receivable = 2;
+}
+
+message RepayRequest {
+  string wallet_id = 1;
+  int64 amount = 2;
+}
+message RepayResponse {
+  Transfer transfer = 1;
+}
+
+message TopUpRequest {
+  string wallet_id = 1;
+  int64 amount = 2;
+}
+message TopUpResponse {
+  Transfer transfer = 1;
+}
+
+message WithdrawRequest {
+  string wallet_id = 1;
+  int64 amount = 2;
+}
+message WithdrawResponse {
+  Transfer transfer = 1;
+}
+
+message GetBalanceRequest {
+  string account_id = 1;
+}
+message GetBalanceResponse {
+  int64 posted = 1;
+  int64 available = 2;
+  repeated Hold active_holds = 3;
+  int64 receivable_owed = 4;
+}
+
+message GetBalanceAtRequest {
+  string account_id = 1;
+  google.protobuf.Timestamp at = 2;
+}
+message GetBalanceAtResponse {
+  int64 posted = 1;
+}
+
+message ListEntriesRequest {
+  string account_id = 1;
+  google.protobuf.Timestamp from = 2;
+  google.protobuf.Timestamp to = 3;
+  string cursor = 4;
+  int32 limit = 5;
+}
+message ListEntriesResponse {
+  repeated Entry entries = 1;
+  string next_cursor = 2;
+}
+
+message ListReceivablesRequest {
+  google.protobuf.Duration min_age = 1;
+  string cursor = 2;
+  int32 limit = 3;
+}
+message ListReceivablesResponse {
+  repeated Receivable receivables = 1;
+  string next_cursor = 2;
+}
