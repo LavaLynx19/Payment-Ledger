@@ -49,9 +49,10 @@ func wallets(t *testing.T, l *Ledger, n int) []uuid.UUID {
 
 func key() string { return "test-" + uuid.NewString() }
 
-// drain captures until no active Hold remains. CaptureNext skips Holds locked
-// by another capturer (SKIP LOCKED), so "nothing claimed" alone doesn't mean
-// the other capturer's work has committed.
+// drain captures until no capturable (active, unexpired) Hold remains.
+// CaptureNext skips Holds locked by another capturer (SKIP LOCKED), so
+// "nothing claimed" alone doesn't mean the other capturer's work has
+// committed. Expired Holds are ignored: only the sweeper (P2.2) finalizes them.
 func drain(t *testing.T, l *Ledger) {
 	t.Helper()
 	ctx := context.Background()
@@ -65,7 +66,9 @@ func drain(t *testing.T, l *Ledger) {
 			continue
 		}
 		var active int
-		if err := l.db.QueryRow(ctx, `SELECT count(*) FROM holds WHERE status = 'active'`).Scan(&active); err != nil {
+		if err := l.db.QueryRow(ctx,
+			`SELECT count(*) FROM holds WHERE status = 'active' AND (expires_at IS NULL OR expires_at > clock_timestamp())`,
+		).Scan(&active); err != nil {
 			t.Fatal(err)
 		}
 		if active == 0 {

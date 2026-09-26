@@ -23,7 +23,7 @@ This plan covers task order, verification, and commit sequence. Requirements are
 - [x] P1.7 `harness/k6/rung1.js` + `harness/run.sh <rung>`: one-command up → migrate → seed → load → check → report → §P1
 - [x] P1.8 Run naive: capture the double-spend (checker fails invariant 3) + record baseline TPS/p99 → §P1
 - [x] P1.9 Fix: version CAS in Accept (Hold bumps version); rerun until clean → §P1
-- [ ] P1.10 `retros/rung-1.md` + set TPS targets for Rungs 2-4 (update README table) → §P1
+- [x] P1.10 `retros/rung-1.md` + set TPS targets for Rungs 2-4 (update README table) → §P1
 
 ### Phase 2 — Feature completion (§P2)
 - [ ] P2.1 PlaceHold / CaptureHold (partial, remainder released) / ReleaseHold → §P2

@@ -193,7 +193,8 @@ holds(
   amount bigint, captured_amount bigint NULL,
   expires_at timestamptz NULL,     -- NULL = never expires (system-initiated: reversal, receivable)
   status text,                     -- 'active'|'captured'|'released'|'expired'
-  INDEX (source_id) WHERE status='active')
+  INDEX (source_id) WHERE status='active',   -- funds check: active Holds per Account
+  INDEX (id) WHERE status='active')          -- capture claim: oldest active Hold without scanning history
 
 entries(
   id uuid PK, transfer_id uuid FK, account_id uuid FK,
