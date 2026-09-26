@@ -14,14 +14,14 @@ This plan covers task order, verification, and commit sequence. Requirements are
 - [x] P0.7 `cmd/seed`: create funding System account + N Wallets → §P0
 
 ### Phase 1 — Rung 1: lost update / double-spend (§P1)
-- [ ] P1.1 Store layer: tx helper, CAS helper with bounded retry, ascending-id row ordering (A§5) → §P1
-- [ ] P1.2 Idempotency insert/match/mismatch/in-flight wait (A§5 Accept step 1) → §P1
-- [ ] P1.3 **Naive** Accept for CreateTransfer + TopUp (no CAS; see A Decision Log) → §P1
-- [ ] P1.4 `cmd/worker` Capture loop with SKIP LOCKED + Entries (direction, balance_after, account_version) → §P1
-- [ ] P1.5 Reads: GetTransfer, GetBalance (Available derived per A§4) → §P1
-- [ ] P1.6 `cmd/checker`: invariants 1-6 as SQL, `--once` / `--interval`, non-zero exit on violation → §P1
-- [ ] P1.7 `harness/k6/rung1.js` + `harness/run.sh <rung>`: one-command up → migrate → seed → load → check → report → §P1
-- [ ] P1.8 Run naive: capture the double-spend (checker fails invariant 3) + record baseline TPS/p99 → §P1
+- [x] P1.1 Store layer: tx helper, CAS helper with bounded retry, ascending-id row ordering (A§5) → §P1
+- [x] P1.2 Idempotency insert/match/mismatch/in-flight wait (A§5 Accept step 1) → §P1
+- [x] P1.3 **Naive** Accept for CreateTransfer + TopUp (no CAS; see A Decision Log) → §P1
+- [x] P1.4 `cmd/worker` Capture loop with SKIP LOCKED + Entries (direction, balance_after, account_version) → §P1
+- [x] P1.5 Reads: GetTransfer, GetBalance (Available derived per A§4) → §P1
+- [x] P1.6 `cmd/checker`: invariants 1-6 as SQL, `--once` / `--interval`, non-zero exit on violation → §P1
+- [x] P1.7 `harness/k6/rung1.js` + `harness/run.sh <rung>`: one-command up → migrate → seed → load → check → report → §P1
+- [x] P1.8 Run naive: capture the double-spend (checker fails invariant 3) + record baseline TPS/p99 → §P1
 - [ ] P1.9 Fix: version CAS in Accept (Hold bumps version); rerun until clean → §P1
 - [ ] P1.10 `retros/rung-1.md` + set TPS targets for Rungs 2-4 (update README table) → §P1
 
