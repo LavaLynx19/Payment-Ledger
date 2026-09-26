@@ -52,6 +52,10 @@ set +e
 status=${PIPESTATUS[0]}
 set -e
 
+# Postgres stays up for inspection. The app stops, so its worker can't
+# capture Holds that integration tests create in the same database.
+"${COMPOSE[@]}" stop api worker >/dev/null 2>&1
+
 step "result"
 echo "k6 summary:   harness/out/rung${RUNG}-summary.json"
 echo "checker:      harness/out/rung${RUNG}-checker.txt (exit $status)"

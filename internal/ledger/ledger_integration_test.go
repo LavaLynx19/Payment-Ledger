@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -48,17 +49,32 @@ func wallets(t *testing.T, l *Ledger, n int) []uuid.UUID {
 
 func key() string { return "test-" + uuid.NewString() }
 
-// drain captures until no Hold is waiting.
+// drain captures until no active Hold remains. CaptureNext skips Holds locked
+// by another capturer (SKIP LOCKED), so "nothing claimed" alone doesn't mean
+// the other capturer's work has committed.
 func drain(t *testing.T, l *Ledger) {
 	t.Helper()
+	ctx := context.Background()
+	deadline := time.Now().Add(10 * time.Second)
 	for {
-		found, err := l.CaptureNext(context.Background())
+		found, err := l.CaptureNext(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !found {
+		if found {
+			continue
+		}
+		var active int
+		if err := l.db.QueryRow(ctx, `SELECT count(*) FROM holds WHERE status = 'active'`).Scan(&active); err != nil {
+			t.Fatal(err)
+		}
+		if active == 0 {
 			return
 		}
+		if time.Now().After(deadline) {
+			t.Fatalf("drain: %d holds still active", active)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -134,6 +150,59 @@ func TestP2PReservesAtAcceptAndPostsOnCapture(t *testing.T) {
 	}
 	if got := balance(t, l, b); got.Posted != 60 {
 		t.Errorf("dest posted=%d, want 60", got.Posted)
+	}
+}
+
+// Rung 1 regression: concurrent Accepts that each fit the balance but not
+// together. Exactly one may win. A single round let the naive Accept through
+// only ~40% of the time, so the test runs several rounds from a start barrier.
+func TestConcurrentAcceptsCannotOverspend(t *testing.T) {
+	l := testLedger(t)
+	for round := range 10 {
+		raceRound(t, l, round)
+	}
+}
+
+func raceRound(t *testing.T, l *Ledger, round int) {
+	t.Helper()
+	ctx := context.Background()
+	ws := wallets(t, l, 2)
+	fund(t, l, ws[0], 100)
+
+	const racers = 20
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var won, insufficient, exhausted int
+	for range racers {
+		wg.Go(func() {
+			<-start
+			_, err := l.CreateTransfer(ctx, AcceptRequest{Key: key(), Hash: []byte("h"), SourceID: ws[0], DestID: ws[1], Amount: 60})
+			var ins *InsufficientFundsError
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				won++
+			case errors.As(err, &ins):
+				insufficient++
+			case errors.Is(err, ErrRetriesExhausted):
+				exhausted++
+			default:
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+	}
+	close(start)
+	wg.Wait()
+
+	if won != 1 {
+		t.Fatalf("round %d: accepted %d transfers of 60 from 100, want exactly 1 (insufficient=%d exhausted=%d)",
+			round, won, insufficient, exhausted)
+	}
+	drain(t, l)
+	if got := balance(t, l, ws[0]); got.Posted != 40 {
+		t.Errorf("round %d: source posted = %d, want 40", round, got.Posted)
 	}
 }
 

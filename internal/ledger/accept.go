@@ -87,9 +87,12 @@ func (l *Ledger) accept(ctx context.Context, typ string, r AcceptRequest) (store
 			}
 		}
 
-		// Rung 1: intentionally naive. There's no CAS on the source, so two
-		// concurrent Accepts can both pass the funds check above (Decision Log →
-		// "Rung 1 ships an intentionally racy Accept"). P1.9 adds the CAS here.
+		// Bump the source's version even though posted doesn't change: a
+		// concurrent Accept that read the same funds now conflicts, retries,
+		// and sees this Hold (Decision Log → "Placing a Hold bumps the Account version").
+		if _, _, err := store.CASAccount(ctx, tx, src.ID, src.Version, 0); err != nil {
+			return err
+		}
 
 		out, err = store.InsertPendingTransfer(ctx, tx, store.Transfer{
 			ID: id, Type: typ, SourceID: src.ID, DestID: dst.ID, Amount: r.Amount,

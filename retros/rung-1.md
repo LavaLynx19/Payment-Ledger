@@ -1,6 +1,6 @@
 # Rung 1 retro: lost update / double-spend
 
-Status: **naive run recorded (P1.8)**. The fix (P1.9) and the final retro (P1.10) are still to come.
+Status: **fix verified (P1.9)**. Targets and the final retro (P1.10) are still to come.
 
 Environment: MacBook M4 Pro, Docker Compose (VM overhead included, so numbers are relative). Postgres 18, 1 api container, 1 worker container (4 capture loops), k6 2.3.0 over gRPC/h2c, 50 VUs × 30s.
 
@@ -41,5 +41,28 @@ Every sender was overspent. The senders drained within the first moments, so nea
 
 Targets are set in P1.10.
 
-## Fix hypothesis (P1.9)
-Version CAS on the source Account in Accept (A§5 step 4; Decision Log → *Placing a Hold bumps the Account version*).
+## Fix (P1.9): the hypothesis held
+The fix is a version CAS on the source Account in Accept, with no balance change (A§5 step 4; Decision Log → *Placing a Hold bumps the Account version*). A loser either blocks on the winner's row lock or sees a changed version. Either way it retries with a fresh read, sees the winner's Hold, and is rejected for insufficient funds.
+
+### Run B again, with the fix (same load)
+| Metric | Naive | Fixed |
+|---|---|---|
+| Requests/s | 16,885 | 16,380 |
+| Accepted / rejected | 49 / 510,281 | 49 / 495,061 |
+| gRPC p99 | 6.20 ms | 6.21 ms |
+| Checker | FAIL (5/5 senders negative, 12 negative Entries) | **CLEAN** |
+| Retries exhausted (ABORTED) | — | 0 |
+
+The fix costs no measurable throughput at this contention level. Rung 3's hot-Account load is where CAS retries are expected to hurt.
+
+### Regression test
+`TestConcurrentAcceptsCannotOverspend` runs 20 racers from a start barrier, each trying to send 60 out of 100, over 10 rounds. Exactly one may win each round.
+- Against the naive Accept: fails 10 of 10 runs.
+- Against the fix: passes 10 of 10 runs under `-race`.
+
+A single round caught the naive code only about 40% of the time (12 of 30), which is why it runs 10.
+
+### Test-isolation bug found along the way
+The harness left the api and worker containers running, and that worker captured Holds created by the integration tests in the same Postgres. The test's `drain` then saw "nothing to claim" (`SKIP LOCKED` skipped the in-flight capture) before that capture had committed. Fixes:
+- `run.sh` stops api and worker at the end.
+- `drain` now waits until no active Hold remains.
