@@ -1,0 +1,6 @@
+.git
+bin
+harness
+retros
+.env*
+*.md

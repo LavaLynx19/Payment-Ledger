@@ -1,4 +1,17 @@
 name: payment-ledger
+
+# Shared settings for every service built from deploy/Dockerfile.
+x-app: &app
+  image: payment-ledger:dev
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+  environment: &app-env
+    DATABASE_URL: postgres://ledger:${POSTGRES_PASSWORD:-ledger-dev}@postgres:5432/ledger?sslmode=disable
+  depends_on:
+    postgres:
+      condition: service_healthy
+
 services:
   postgres:
     image: postgres:18
@@ -15,5 +28,52 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+
+  migrate:
+    <<: *app
+    command: ["api", "migrate"]
+    profiles: ["tools"]
+
+  seed:
+    <<: *app
+    entrypoint: ["seed"]
+    profiles: ["tools"]
+
+  checker:
+    <<: *app
+    entrypoint: ["checker"]
+    command: ["--once"]
+    profiles: ["tools"]
+
+  api:
+    <<: *app
+    command: ["api", "serve"]
+    environment:
+      <<: *app-env
+      LEDGER_SERVICE_TOKENS: ${LEDGER_SERVICE_TOKENS:-dev-token}
+      HOLD_TTL: ${HOLD_TTL:-30s}
+      CAS_ATTEMPTS: ${CAS_ATTEMPTS:-10}
+    ports:
+      - "18080:8080"
+
+  worker:
+    <<: *app
+    command: ["worker"]
+    environment:
+      <<: *app-env
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+      CAS_ATTEMPTS: ${CAS_ATTEMPTS:-10}
+
+  k6:
+    image: grafana/k6:2.3.0
+    profiles: ["load"]
+    environment:
+      TARGET: api:8080
+      LEDGER_TOKEN: ${LEDGER_SERVICE_TOKENS:-dev-token}
+    volumes:
+      - ../harness/k6:/scripts:ro
+      - ../proto:/proto:ro
+      - ../harness/out:/out
+
 volumes:
   pgdata: {}
