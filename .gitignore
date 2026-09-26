@@ -1,0 +1,14 @@
+# build output
+/bin/
+
+# harness run output (k6 summaries, logs)
+/harness/out/
+
+# secrets
+.env*
+!.env.example
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
