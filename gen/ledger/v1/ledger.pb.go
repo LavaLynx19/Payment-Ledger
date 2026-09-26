@@ -252,6 +252,7 @@ const (
 	ErrorDetail_REASON_CONFLICT_RETRIES_EXHAUSTED ErrorDetail_Reason = 6
 	ErrorDetail_REASON_NOT_FOUND                  ErrorDetail_Reason = 7
 	ErrorDetail_REASON_UNAUTHENTICATED            ErrorDetail_Reason = 8
+	ErrorDetail_REASON_INVALID_REQUEST            ErrorDetail_Reason = 9
 )
 
 // Enum value maps for ErrorDetail_Reason.
@@ -266,6 +267,7 @@ var (
 		6: "REASON_CONFLICT_RETRIES_EXHAUSTED",
 		7: "REASON_NOT_FOUND",
 		8: "REASON_UNAUTHENTICATED",
+		9: "REASON_INVALID_REQUEST",
 	}
 	ErrorDetail_Reason_value = map[string]int32{
 		"REASON_UNSPECIFIED":                0,
@@ -277,6 +279,7 @@ var (
 		"REASON_CONFLICT_RETRIES_EXHAUSTED": 6,
 		"REASON_NOT_FOUND":                  7,
 		"REASON_UNAUTHENTICATED":            8,
+		"REASON_INVALID_REQUEST":            9,
 	}
 )
 
@@ -2125,9 +2128,9 @@ const file_ledger_v1_ledger_proto_rawDesc = "" +
 	"\x10debtor_wallet_id\x18\x01 \x01(\tR\x0edebtorWalletId\x122\n" +
 	"\x15receivable_account_id\x18\x02 \x01(\tR\x13receivableAccountId\x12\x12\n" +
 	"\x04owed\x18\x03 \x01(\x03R\x04owed\x127\n" +
-	"\topened_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\bopenedAt\"\xd1\x02\n" +
+	"\topened_at\x18\x04 \x01(\v2\x1a.google.protobuf.TimestampR\bopenedAt\"\xed\x02\n" +
 	"\vErrorDetail\x125\n" +
-	"\x06reason\x18\x01 \x01(\x0e2\x1d.ledger.v1.ErrorDetail.ReasonR\x06reason\"\x8a\x02\n" +
+	"\x06reason\x18\x01 \x01(\x0e2\x1d.ledger.v1.ErrorDetail.ReasonR\x06reason\"\xa6\x02\n" +
 	"\x06Reason\x12\x16\n" +
 	"\x12REASON_UNSPECIFIED\x10\x00\x12\x1d\n" +
 	"\x19REASON_INSUFFICIENT_FUNDS\x10\x01\x12\x1a\n" +
@@ -2137,7 +2140,8 @@ const file_ledger_v1_ledger_proto_rawDesc = "" +
 	"\x1bREASON_IDEMPOTENCY_MISMATCH\x10\x05\x12%\n" +
 	"!REASON_CONFLICT_RETRIES_EXHAUSTED\x10\x06\x12\x14\n" +
 	"\x10REASON_NOT_FOUND\x10\a\x12\x1a\n" +
-	"\x16REASON_UNAUTHENTICATED\x10\b\"\x9b\x01\n" +
+	"\x16REASON_UNAUTHENTICATED\x10\b\x12\x1a\n" +
+	"\x16REASON_INVALID_REQUEST\x10\t\"\x9b\x01\n" +
 	"\x15CreateTransferRequest\x12\x1b\n" +
 	"\tsource_id\x18\x01 \x01(\tR\bsourceId\x12\x17\n" +
 	"\adest_id\x18\x02 \x01(\tR\x06destId\x12\x16\n" +

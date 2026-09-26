@@ -123,6 +123,7 @@ message ErrorDetail {
     REASON_CONFLICT_RETRIES_EXHAUSTED = 6;
     REASON_NOT_FOUND = 7;
     REASON_UNAUTHENTICATED = 8;
+    REASON_INVALID_REQUEST = 9;
   }
   Reason reason = 1;
 }
