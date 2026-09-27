@@ -2,6 +2,8 @@ package ledger
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -22,17 +24,89 @@ type AcceptRequest struct {
 
 // CreateTransfer accepts a P2P Transfer between two Wallets.
 func (l *Ledger) CreateTransfer(ctx context.Context, r AcceptRequest) (store.Transfer, error) {
-	return l.accept(ctx, TypeP2P, r)
+	return l.accept(ctx, TypeP2P, CaptureAuto, r)
 }
 
 // TopUp accepts a Transfer from the funding System account into a Wallet.
 func (l *Ledger) TopUp(ctx context.Context, key string, hash []byte, walletID uuid.UUID, amount int64) (store.Transfer, error) {
-	return l.accept(ctx, TypeTopUp, AcceptRequest{Key: key, Hash: hash, SourceID: l.fundingID, DestID: walletID, Amount: amount})
+	return l.accept(ctx, TypeTopUp, CaptureAuto,
+		AcceptRequest{Key: key, Hash: hash, SourceID: l.fundingID, DestID: walletID, Amount: amount})
+}
+
+// Withdraw accepts a Transfer from a Wallet into the funding System account.
+func (l *Ledger) Withdraw(ctx context.Context, key string, hash []byte, walletID uuid.UUID, amount int64) (store.Transfer, error) {
+	return l.accept(ctx, TypeWithdrawal, CaptureAuto,
+		AcceptRequest{Key: key, Hash: hash, SourceID: walletID, DestID: l.fundingID, Amount: amount})
+}
+
+// Repay accepts a Repayment from a Wallet into its own receivable System
+// account. It's the one debit an open Receivable doesn't block.
+func (l *Ledger) Repay(ctx context.Context, key string, hash []byte, walletID uuid.UUID, amount int64) (store.Transfer, error) {
+	recvID, err := store.ReceivableAccountID(ctx, l.db, walletID)
+	if errors.Is(err, store.ErrAccountNotFound) {
+		return store.Transfer{}, invalid("wallet_id has no receivable to repay.")
+	}
+	if err != nil {
+		return store.Transfer{}, err
+	}
+	return l.accept(ctx, TypeRepayment, CaptureAuto,
+		AcceptRequest{Key: key, Hash: hash, SourceID: walletID, DestID: recvID, Amount: amount})
+}
+
+// endpoints is which Account kind each Transfer type may use as source and
+// destination. The ledger fills in System-account ids itself, so a mismatch
+// always points at the caller's id field.
+var endpoints = map[string]struct{ source, dest, field string }{
+	TypeP2P:        {"wallet", "wallet", ""},
+	TypeTopUp:      {"system", "wallet", "wallet_id"},
+	TypeWithdrawal: {"wallet", "system", "wallet_id"},
+	TypeRepayment:  {"wallet", "system", "wallet_id"},
+}
+
+// checkReceivable enforces the Receivable rules on a Wallet source: an open
+// Receivable blocks every debit except a Repayment, and a Repayment can't
+// exceed what's still owed once pending Repayments land. The caller has
+// already read src, and its CAS on src makes this race-free against a
+// Reversal, which bumps the debtor Wallet's version (Decision Log).
+func checkReceivable(ctx context.Context, tx pgx.Tx, typ string, src, dst store.Account, amount int64) error {
+	owed, err := store.ReceivableOwed(ctx, tx, src.ID)
+	if err != nil {
+		return err
+	}
+	if typ != TypeRepayment {
+		if owed > 0 {
+			return &ReceivableOpenError{Owed: owed}
+		}
+		return nil
+	}
+	pending, err := store.PendingInto(ctx, tx, dst.ID)
+	if err != nil {
+		return err
+	}
+	if remaining := owed - pending; amount > remaining {
+		return invalid(fmt.Sprintf("amount must be at most %d, the amount still owed.", max(remaining, 0)))
+	}
+	return nil
+}
+
+func checkEndpoints(typ string, src, dst store.Account) error {
+	e := endpoints[typ]
+	switch {
+	case src.Kind != e.source && e.field != "":
+		return invalid(e.field + " must be a wallet.")
+	case src.Kind != e.source:
+		return invalid("source_id must be a " + e.source + ".")
+	case dst.Kind != e.dest && e.field != "":
+		return invalid(e.field + " must be a wallet.")
+	case dst.Kind != e.dest:
+		return invalid("dest_id must be a " + e.dest + ".")
+	}
+	return nil
 }
 
 // accept is A§5 Accept: claim the key, check funds, place the Hold, and return
 // the Transfer as PENDING. A known key returns its original Transfer.
-func (l *Ledger) accept(ctx context.Context, typ string, r AcceptRequest) (store.Transfer, error) {
+func (l *Ledger) accept(ctx context.Context, typ, captureMode string, r AcceptRequest) (store.Transfer, error) {
 	if r.Amount <= 0 {
 		return store.Transfer{}, invalid("amount must be greater than 0.")
 	}
@@ -70,14 +144,14 @@ func (l *Ledger) accept(ctx context.Context, typ string, r AcceptRequest) (store
 		if err != nil {
 			return err
 		}
-		if dst.Kind != "wallet" {
-			return invalid("dest_id must be a wallet.")
-		}
-		if typ == TypeP2P && src.Kind != "wallet" {
-			return invalid("source_id must be a wallet.")
+		if err := checkEndpoints(typ, src, dst); err != nil {
+			return err
 		}
 
 		if src.Kind == "wallet" {
+			if err := checkReceivable(ctx, tx, typ, src, dst, r.Amount); err != nil {
+				return err
+			}
 			held, err := store.ActiveHoldTotal(ctx, tx, src.ID)
 			if err != nil {
 				return err
@@ -96,7 +170,7 @@ func (l *Ledger) accept(ctx context.Context, typ string, r AcceptRequest) (store
 
 		out, err = store.InsertPendingTransfer(ctx, tx, store.Transfer{
 			ID: id, Type: typ, SourceID: src.ID, DestID: dst.ID, Amount: r.Amount,
-		}, ttl)
+		}, ttl, captureMode)
 		return err
 	})
 	return out, err
