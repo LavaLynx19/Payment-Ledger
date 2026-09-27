@@ -18,7 +18,10 @@ type Querier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-var ErrTransferNotFound = errors.New("store: transfer not found")
+var (
+	ErrTransferNotFound = errors.New("store: transfer not found")
+	ErrHoldNotFound     = errors.New("store: hold not found")
+)
 
 type Transfer struct {
 	ID         uuid.UUID
@@ -41,6 +44,7 @@ type Hold struct {
 	CapturedAmount *int64
 	ExpiresAt      *time.Time // nil = never expires
 	Status         string
+	CaptureMode    string // "auto" (worker) or "manual" (PlaceHold)
 }
 
 type Entry struct {
@@ -53,7 +57,7 @@ type Entry struct {
 }
 
 const transferCols = `id, type, source_id, dest_id, amount, status, reverses_id, created_at, posted_at`
-const holdCols = `id, transfer_id, source_id, dest_id, amount, captured_amount, expires_at, status`
+const holdCols = `id, transfer_id, source_id, dest_id, amount, captured_amount, expires_at, status, capture_mode`
 
 // activeHold matches Holds that still reserve funds: active and not past expiry
 // (A§4 lazy expiry).
@@ -67,8 +71,38 @@ func scanTransfer(row pgx.Row) (Transfer, error) {
 
 func scanHold(row pgx.Row) (Hold, error) {
 	var h Hold
-	err := row.Scan(&h.ID, &h.TransferID, &h.SourceID, &h.DestID, &h.Amount, &h.CapturedAmount, &h.ExpiresAt, &h.Status)
+	err := row.Scan(&h.ID, &h.TransferID, &h.SourceID, &h.DestID, &h.Amount, &h.CapturedAmount, &h.ExpiresAt, &h.Status, &h.CaptureMode)
 	return h, err
+}
+
+func holdResult(h Hold, err error) (Hold, error) {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Hold{}, ErrHoldNotFound
+	}
+	if err != nil {
+		return Hold{}, fmt.Errorf("get hold: %w", err)
+	}
+	return h, nil
+}
+
+// LockHold reads a Hold and locks it until tx ends, serializing CaptureHold,
+// ReleaseHold and any other writer on it.
+func LockHold(ctx context.Context, tx pgx.Tx, id uuid.UUID) (Hold, error) {
+	return holdResult(scanHold(tx.QueryRow(ctx, `SELECT `+holdCols+` FROM holds WHERE id = $1 FOR UPDATE`, id)))
+}
+
+func GetHoldByTransfer(ctx context.Context, q Querier, transferID uuid.UUID) (Hold, error) {
+	return holdResult(scanHold(q.QueryRow(ctx, `SELECT `+holdCols+` FROM holds WHERE transfer_id = $1`, transferID)))
+}
+
+// MarkHoldReleased moves an active, unexpired Hold to released. It reports
+// false when the Hold has already expired.
+func MarkHoldReleased(ctx context.Context, tx pgx.Tx, holdID uuid.UUID) (bool, error) {
+	tag, err := tx.Exec(ctx, `UPDATE holds SET status = 'released' WHERE id = $1 AND `+activeHold, holdID)
+	if err != nil {
+		return false, fmt.Errorf("release hold: %w", err)
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 func GetTransfer(ctx context.Context, q Querier, id uuid.UUID) (Transfer, error) {
@@ -84,8 +118,8 @@ func GetTransfer(ctx context.Context, q Querier, id uuid.UUID) (Transfer, error)
 
 // InsertPendingTransfer creates t as a pending Transfer together with its
 // active Hold. The Hold expires holdTTL after now (database clock), or never
-// when holdTTL is 0.
-func InsertPendingTransfer(ctx context.Context, tx pgx.Tx, t Transfer, holdTTL time.Duration) (Transfer, error) {
+// when holdTTL is 0. captureMode is "auto" or "manual".
+func InsertPendingTransfer(ctx context.Context, tx pgx.Tx, t Transfer, holdTTL time.Duration, captureMode string) (Transfer, error) {
 	out, err := scanTransfer(tx.QueryRow(ctx,
 		`INSERT INTO transfers (id, type, source_id, dest_id, amount, status, reverses_id)
 		 VALUES ($1, $2, $3, $4, $5, 'pending', $6)
@@ -100,11 +134,11 @@ func InsertPendingTransfer(ctx context.Context, tx pgx.Tx, t Transfer, holdTTL t
 		return Transfer{}, err
 	}
 	_, err = tx.Exec(ctx,
-		`INSERT INTO holds (id, transfer_id, source_id, dest_id, amount, status, expires_at)
-		 VALUES ($1, $2, $3, $4, $5, 'active',
+		`INSERT INTO holds (id, transfer_id, source_id, dest_id, amount, status, capture_mode, expires_at)
+		 VALUES ($1, $2, $3, $4, $5, 'active', $7,
 		         CASE WHEN $6::bigint = 0 THEN NULL
 		              ELSE clock_timestamp() + $6::bigint * interval '1 microsecond' END)`,
-		holdID, t.ID, t.SourceID, t.DestID, t.Amount, holdTTL.Microseconds())
+		holdID, t.ID, t.SourceID, t.DestID, t.Amount, holdTTL.Microseconds(), captureMode)
 	if err != nil {
 		return Transfer{}, fmt.Errorf("insert hold: %w", err)
 	}
@@ -132,11 +166,11 @@ func ActiveHolds(ctx context.Context, q Querier, accountID uuid.UUID) ([]Hold, e
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Hold, error) { return scanHold(r) })
 }
 
-// ClaimCapturableHold locks the oldest active Hold that no other worker holds
-// (FOR UPDATE SKIP LOCKED). It reports false when none is available.
+// ClaimCapturableHold locks the oldest active auto-capture Hold that no other
+// worker holds (FOR UPDATE SKIP LOCKED). It reports false when none is available.
 func ClaimCapturableHold(ctx context.Context, tx pgx.Tx) (Hold, bool, error) {
 	h, err := scanHold(tx.QueryRow(ctx,
-		`SELECT `+holdCols+` FROM holds WHERE `+activeHold+`
+		`SELECT `+holdCols+` FROM holds WHERE capture_mode = 'auto' AND `+activeHold+`
 		 ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Hold{}, false, nil
