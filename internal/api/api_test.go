@@ -27,6 +27,7 @@ func TestErrorTable(t *testing.T) {
 		{ErrConflictRetriesExhausted(), connect.CodeAborted, ledgerv1.ErrorDetail_REASON_CONFLICT_RETRIES_EXHAUSTED},
 		{ErrNotFound("transfer", "x"), connect.CodeNotFound, ledgerv1.ErrorDetail_REASON_NOT_FOUND},
 		{ErrUnauthenticated(), connect.CodeUnauthenticated, ledgerv1.ErrorDetail_REASON_UNAUTHENTICATED},
+		{ErrInvalidRequest("amount must be greater than 0."), connect.CodeInvalidArgument, ledgerv1.ErrorDetail_REASON_INVALID_REQUEST},
 	}
 	for _, c := range cases {
 		if c.err.Code() != c.code {
@@ -43,12 +44,14 @@ func TestAuth(t *testing.T) {
 	defer srv.Close()
 	client := ledgerv1connect.NewLedgerServiceClient(http.DefaultClient, srv.URL)
 
+	// ListReceivables stays unimplemented until P2.6, so a valid token reaching it
+	// proves auth passed without needing a ledger.
 	call := func(token string) error {
-		req := connect.NewRequest(&ledgerv1.GetTransferRequest{Id: "x"})
+		req := connect.NewRequest(&ledgerv1.ListReceivablesRequest{})
 		if token != "" {
 			req.Header().Set("Authorization", "Bearer "+token)
 		}
-		_, err := client.GetTransfer(context.Background(), req)
+		_, err := client.ListReceivables(context.Background(), req)
 		return err
 	}
 

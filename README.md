@@ -70,14 +70,14 @@ Moving money between accounts sounds simple, but it breaks under concurrency, cr
 
 ## Rung Ladder
 
-Each **Rung** has a named problem to expose and a TPS target. Targets are multiples of the baseline measured at Rung 1.
+Each **Rung** has a named problem to expose and a TPS target. Targets are multiples of the baseline measured at Rung 1: **2,000 posted Transfers/s sustained end to end, p99 3.78 ms** (see `retros/rung-1.md`). Each Rung's latency gate is p99 ≤ 2× baseline, which is **7.6 ms**.
 
 | # | Problem exposed | TPS target |
 |---|-----------------|------------|
-| 1 | Lost update / double-spend under concurrent debits | Baseline (measured) |
-| 2 | Crash mid-Transfer: recovery with no lost or duplicated money | Set after Rung 1 |
-| 3 | Hot Account contention (one Account in most Transfers) | Set after Rung 1 |
-| 4 | Sharding and cross-shard Transfers | Set after Rung 1 |
+| 1 | Lost update / double-spend under concurrent debits | Baseline: 2,000 posted/s |
+| 2 | Crash mid-Transfer: recovery with no lost or duplicated money | ≥ 1× (2,000 posted/s): crash safety must not cost throughput |
+| 3 | Hot Account contention (one Account in most Transfers) | ≥ 1× (2,000 posted/s) with most traffic on one hot Account |
+| 4 | Sharding and cross-shard Transfers | Relative: sharded Postgres vs TigerBeetle reported as ratios, since everything runs on one machine |
 
 Rung 4 is where the trade-off between strict reads, never-negative Wallets, and cross-shard Transfers gets decided. Designs for earlier Rungs must not rule out any of those choices.
 

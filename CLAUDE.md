@@ -21,9 +21,6 @@ Go, connect-go over h2c, pgx v5 + pgxpool, goose, PostgreSQL via Docker Compose,
 - Errors come from the A§7 table: Connect code + `reason` + human message. New reasons go into A§7 first.
 - Failpoints use the names in A§5 exactly. Each is a no-op unless its env var enables it.
 
-## The naive Accept (Rung 1)
-Until P1.9, Accept is intentionally **naive**: it has no CAS (Decision Log → *Rung 1 ships an intentionally racy Accept*). Keep it racy until the P1.8 run has recorded the double-spend. The fix lands as its own P1.9 commit.
-
 ## Database
 - Schema changes go in a new goose migration under `migrations/`. Applied migrations stay unchanged.
 - Tests that touch SQL run against the Compose Postgres. The invariant checker (`cmd/checker --once`) must be clean after every integration or harness run.

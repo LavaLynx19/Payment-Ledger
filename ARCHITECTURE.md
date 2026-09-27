@@ -193,7 +193,8 @@ holds(
   amount bigint, captured_amount bigint NULL,
   expires_at timestamptz NULL,     -- NULL = never expires (system-initiated: reversal, receivable)
   status text,                     -- 'active'|'captured'|'released'|'expired'
-  INDEX (source_id) WHERE status='active')
+  INDEX (source_id) WHERE status='active',   -- funds check: active Holds per Account
+  INDEX (id) WHERE status='active')          -- capture claim: oldest active Hold without scanning history
 
 entries(
   id uuid PK, transfer_id uuid FK, account_id uuid FK,
@@ -216,7 +217,7 @@ idempotency_keys(
 **Invariants** (all enforced by the checker in §8)
 1. Σ debit amounts = Σ credit amounts, both over the whole ledger and per Transfer.
 2. `accounts.posted` = Σ normal-direction Entries − Σ opposite-direction Entries = its latest Entry's `balance_after`.
-3. Wallet `posted` ≥ 0 and Wallet Available balance ≥ 0.
+3. A Wallet never goes negative at any point in its history. That means current `posted` ≥ 0, current Available balance ≥ 0, and no Wallet Entry has `balance_after` < 0. The history part matters because later credits can refill an overspent Wallet before a current-state check runs.
 4. Per Account, `account_version` values on Entries strictly increase and are unique.
 5. Every posted Transfer has exactly one captured Hold. No Hold is both captured and expired.
 6. Every idempotency key maps to exactly one Transfer.
@@ -307,7 +308,7 @@ Package `ledger.v1`, service `LedgerService`. It's served as gRPC and as Connect
 
 **Headers**
 - `Authorization: Bearer <service token>` on every call.
-- `Idempotency-Key` is required on every mutating RPC. The request hash is SHA-256 of the canonical protobuf encoding.
+- `Idempotency-Key` is required on every mutating RPC. The request hash is SHA-256 of the RPC procedure name (e.g. `/ledger.v1.LedgerService/TopUp`), a zero byte, and the deterministic protobuf encoding of the request. TopUp, Withdraw and Repay share one message shape, so including the procedure turns a key reused across RPCs into `IDEMPOTENCY_MISMATCH` instead of a false match. Keys are global, not per RPC.
 
 **Errors** use a Connect code, a `reason` detail, and a message written for humans. `{…}` placeholders are filled from the request or ledger state.
 
@@ -320,6 +321,7 @@ Package `ledger.v1`, service `LedgerService`. It's served as gRPC and as Connect
 | IDEMPOTENCY_MISMATCH | ALREADY_EXISTS | 409 | "This Idempotency-Key was already used with a different request. Use a new key for a new request." |
 | CONFLICT_RETRIES_EXHAUSTED | ABORTED | 409 | "The account was busy and the request couldn't be applied. Retry with the same Idempotency-Key." |
 | NOT_FOUND | NOT_FOUND | 404 | "No {resource} found with id {id}." |
+| INVALID_REQUEST | INVALID_ARGUMENT | 400 | Names the field and rule, e.g. "amount must be greater than 0." |
 | UNAUTHENTICATED | UNAUTHENTICATED | 401 | "Missing or invalid service token." |
 
 ## 8. Rung mechanics
