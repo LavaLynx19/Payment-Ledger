@@ -124,6 +124,7 @@ message ErrorDetail {
     REASON_NOT_FOUND = 7;
     REASON_UNAUTHENTICATED = 8;
     REASON_INVALID_REQUEST = 9;
+    REASON_TRANSFER_NOT_REVERSIBLE = 10;
   }
   Reason reason = 1;
 }
@@ -181,6 +182,7 @@ message ReverseTransferRequest {
   string transfer_id = 1;
 }
 message ReverseTransferResponse {
+  // Unset when the recipient had nothing available to send back.
   Transfer reversal = 1;
   // Set only when the recipient could not cover the full amount.
   Transfer receivable = 2;
