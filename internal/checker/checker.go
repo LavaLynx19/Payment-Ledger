@@ -17,7 +17,7 @@ type Check struct {
 	SQL       string // SELECT detail text, one row per violation
 }
 
-// Checks are the A§4 invariants 1-6.
+// Checks are the A§4 invariants 1-7.
 var Checks = []Check{
 	{1, "ledger balanced (Σ debits = Σ credits)", `
 		SELECT 'ledger off by ' || s FROM (
@@ -73,9 +73,38 @@ var Checks = []Check{
 		LEFT JOIN (SELECT transfer_id, count(*) AS n FROM entries GROUP BY transfer_id) e ON e.transfer_id = t.id
 		WHERE (t.status = 'posted') <> (h.status IS NOT DISTINCT FROM 'captured')
 		   OR (t.status = 'posted') <> (coalesce(e.n, 0) > 0)`},
-	{6, "each idempotency key maps to one transfer", `
-		SELECT 'transfer ' || transfer_id || ' claimed by ' || count(*) || ' keys'
-		FROM idempotency_keys GROUP BY transfer_id HAVING count(*) > 1`},
+	{5, "posted transfers post exactly the hold's captured amount", `
+		SELECT 'transfer ' || t.id || ' posted ' || coalesce(e.debits, 0)
+		       || ' but hold captured ' || coalesce(h.captured_amount::text, 'none')
+		FROM transfers t
+		JOIN holds h ON h.transfer_id = t.id
+		LEFT JOIN (
+			SELECT transfer_id, sum(amount) FILTER (WHERE direction = 'debit') AS debits
+			FROM entries GROUP BY transfer_id
+		) e ON e.transfer_id = t.id
+		WHERE t.status = 'posted' AND coalesce(e.debits, 0) <> coalesce(h.captured_amount, -1)`},
+	// Several keys may name one Transfer (PlaceHold, then CaptureHold or ReleaseHold).
+	{6, "each idempotency key maps to an existing transfer", `
+		SELECT 'key ' || k.key || ' points at missing transfer ' || k.transfer_id
+		FROM idempotency_keys k LEFT JOIN transfers t ON t.id = k.transfer_id
+		WHERE t.id IS NULL`},
+	{7, "reversals return exactly the posted amount, once", `
+		SELECT 'transfer ' || o.id || ' posted ' || h.captured_amount || ' but reversals total '
+		       || sum(r.amount) || ' across ' || count(*) || ' transfers'
+		FROM transfers r
+		JOIN transfers o ON o.id = r.reverses_id
+		JOIN holds h ON h.transfer_id = o.id
+		GROUP BY o.id, h.captured_amount
+		HAVING sum(r.amount) <> h.captured_amount
+		    OR count(*) FILTER (WHERE r.type = 'reversal') > 1
+		    OR count(*) FILTER (WHERE r.type = 'receivable') > 1`},
+	{7, "receivables never overpaid", `
+		SELECT 'receivable account ' || a.id || ' posted=' || a.posted
+		FROM accounts a WHERE a.subtype = 'receivable' AND a.posted < 0
+		UNION ALL
+		SELECT 'receivable account ' || e.account_id || ' went to ' || e.balance_after || ' at version ' || e.account_version
+		FROM entries e JOIN accounts a ON a.id = e.account_id
+		WHERE a.subtype = 'receivable' AND e.balance_after < 0`},
 }
 
 type Result struct {

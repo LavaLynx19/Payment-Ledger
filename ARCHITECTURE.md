@@ -193,8 +193,9 @@ holds(
   amount bigint, captured_amount bigint NULL,
   expires_at timestamptz NULL,     -- NULL = never expires (system-initiated: reversal, receivable)
   status text,                     -- 'active'|'captured'|'released'|'expired'
-  INDEX (source_id) WHERE status='active',   -- funds check: active Holds per Account
-  INDEX (id) WHERE status='active')          -- capture claim: oldest active Hold without scanning history
+  capture_mode text,               -- 'auto': the worker captures it | 'manual': PlaceHold, the caller captures or releases it
+  INDEX (source_id) WHERE status='active',                          -- funds check: active Holds per Account
+  INDEX (id) WHERE status='active' AND capture_mode='auto')         -- capture claim: oldest auto Hold without scanning history
 
 entries(
   id uuid PK, transfer_id uuid FK, account_id uuid FK,
@@ -219,8 +220,9 @@ idempotency_keys(
 2. `accounts.posted` = Σ normal-direction Entries − Σ opposite-direction Entries = its latest Entry's `balance_after`.
 3. A Wallet never goes negative at any point in its history. That means current `posted` ≥ 0, current Available balance ≥ 0, and no Wallet Entry has `balance_after` < 0. The history part matters because later credits can refill an overspent Wallet before a current-state check runs.
 4. Per Account, `account_version` values on Entries strictly increase and are unique.
-5. Every posted Transfer has exactly one captured Hold. No Hold is both captured and expired.
+5. Every posted Transfer has exactly one captured Hold, and its Entries post exactly the Hold's `captured_amount`. `transfers.amount` stays the requested amount. No Hold is both captured and expired.
 6. Every idempotency key maps to exactly one Transfer.
+7. A reversed Transfer has at most one reversal and one receivable Transfer, and their amounts sum to its posted amount. A receivable System account never goes below zero, now or in its history, so no Receivable is ever overpaid.
 
 ## 5. Write paths
 
@@ -237,24 +239,28 @@ All paths run inside a single transaction under READ COMMITTED. A "CAS" is `UPDA
 - `failpoint accept.after_commit`: the client never gets a response, retries, and receives the same ID.
 
 **Capture (worker)**
-1. Claim: `SELECT … FROM holds WHERE status='active' AND (expires_at IS NULL OR expires_at > clock_timestamp()) … FOR UPDATE SKIP LOCKED LIMIT n`.
+1. Claim: `SELECT … FROM holds WHERE status='active' AND capture_mode='auto' AND (expires_at IS NULL OR expires_at > clock_timestamp()) … FOR UPDATE SKIP LOCKED LIMIT n`. Manual Holds (PlaceHold) are never claimed.
 2. `UPDATE holds SET status='captured' WHERE id=$1 AND status='active' AND (expires_at IS NULL OR expires_at > clock_timestamp())`. If this affects 0 rows, expiry won the race, so the Transfer is marked failed. First commit wins.
 3. CAS the source and destination in `id` order, debiting the source and crediting the destination. Each moves `posted` according to that Account's normal balance. Then insert the debit and credit Entries with `balance_after`, `account_version` = new version, and `created_at = clock_timestamp()`.
 4. Set the Transfer to `posted`. Commit.
 
-Partial capture (`CaptureHold` with amount < Hold) posts only that amount, and the remainder is released in the same tx.
+**CaptureHold** (manual Holds only; runs synchronously in the API request)
+1. Lock the Hold (`SELECT … FOR UPDATE`), which serializes it against Release and other Captures. Then claim the Idempotency-Key against the Hold's Transfer. A replay returns the current Transfer and Hold.
+2. Reject if the Hold is not active (`HOLD_NOT_ACTIVE`), if it's an auto Hold (`INVALID_REQUEST`), or if the amount isn't between 1 and the Hold amount.
+3. Run Capture steps 2-4 for the requested amount (full amount by default). `captured_amount` records what was posted, the remainder is released in the same tx, and `transfers.amount` keeps the requested amount. If expiry won step 2, return `HOLD_EXPIRED`.
 
 - `failpoint capture.after_claim` and `failpoint capture.after_entries` crash before commit, so the tx aborts, the row lock is released, and another worker re-claims.
 - `failpoint capture.after_commit` crashes after commit. Nothing is lost, and the next claim skips the already-captured Hold.
 
 **Release / expiry**
-- `ReleaseHold`: `UPDATE holds SET status='released' WHERE status='active'`, then CAS the source. The Transfer fails. `failpoint release.before_commit` sits here.
+- `ReleaseHold` (manual Holds only; lock and key claim as in CaptureHold): `UPDATE holds SET status='released' WHERE status='active'`, then CAS the source. The Transfer fails. `failpoint release.before_commit` sits here.
 - Sweeper: batch `UPDATE holds SET status='expired' WHERE status='active' AND expires_at <= clock_timestamp()`, then mark their Transfers failed. This only finalizes records, because reads already ignore expired Holds. Holds with no expiry are never touched. `failpoint sweeper.mid_batch` sits here.
 - Purge: the same loop deletes `idempotency_keys` older than 24h, in batches. `failpoint purge.mid_batch` sits here.
 
 **Reversal of Transfer T (A → B, amount X)**
-In one tx:
-1. Compute r = min(X, B's Available).
+Only posted P2P Transfers can be reversed, once. X is the amount actually posted (the Hold's `captured_amount`). In one tx:
+0. Lock T (`SELECT … FOR UPDATE`), then claim the key. A replay returns T's existing reversal Transfers. Reject with `TRANSFER_NOT_REVERSIBLE` if T isn't a posted P2P Transfer or already has a reversal.
+1. Compute r = min(X, B's Available). When r = 0 only the receivable Transfer is created, and when X − r = 0 only the reversal Transfer is.
 2. Create a `reversal` Transfer and Hold for B → A of r. Create a `receivable` Transfer and Hold for B's receivable System account → A of X − r, creating that System account if it doesn't exist yet.
 3. CAS B's Wallet and B's receivable account, so the debtor Wallet's version is bumped even when r = 0.
 
@@ -263,7 +269,7 @@ Both Holds have no expiry (`expires_at` NULL). See Decision Log → *System-init
 - `failpoint reversal.after_commit`: the caller retries with the same key and gets the same Transfers back.
 
 **Repayment**
-An Accept of type `repayment` from Wallet W → W's receivable System account. The amount must be ≤ the owed amount. It's exempt from the `RECEIVABLE_OPEN` check.
+An Accept of type `repayment` from Wallet W → W's receivable System account. The amount must be ≤ the owed amount minus Repayments still pending, so two in-flight Repayments can't overpay. A Wallet with no receivable account gets `INVALID_REQUEST`. It's exempt from the `RECEIVABLE_OPEN` check. Every other debit from a Wallet (P2P, PlaceHold, Withdraw) is blocked while the Wallet owes anything.
 
 **Rung 1 naive variant**
 Steps 2-5 of Accept without the CAS in step 4. Two concurrent Accepts both pass the funds check, which is the double-spend.
@@ -306,6 +312,11 @@ Package `ledger.v1`, service `LedgerService`. It's served as gRPC and as Connect
 | ListEntries | account_id, from, to, cursor, limit | entries, next_cursor |
 | ListReceivables | min_age?, cursor | receivables (debtor, owed, age) |
 
+**Read semantics**
+- `GetBalanceAt`: `balance_after` of the Account's latest Entry with `created_at ≤ at`, ties broken by `account_version`. 0 if there's none.
+- `ListEntries`: Entries in `account_version` order, optionally bounded by `from ≤ created_at < to`. The cursor is opaque and encodes the last version returned. `limit` defaults to 100 and is capped at 1000.
+- `ListReceivables`: Wallets that owe more than 0, including shortfalls whose Holds aren't captured yet, ordered by debtor id with an opaque cursor. `opened_at` is when the oldest receivable Transfer was created since the debtor last owed nothing. `min_age` keeps only Receivables opened at least that long ago.
+
 **Headers**
 - `Authorization: Bearer <service token>` on every call.
 - `Idempotency-Key` is required on every mutating RPC. The request hash is SHA-256 of the RPC procedure name (e.g. `/ledger.v1.LedgerService/TopUp`), a zero byte, and the deterministic protobuf encoding of the request. TopUp, Withdraw and Repay share one message shape, so including the procedure turns a key reused across RPCs into `IDEMPOTENCY_MISMATCH` instead of a false match. Keys are global, not per RPC.
@@ -322,6 +333,7 @@ Package `ledger.v1`, service `LedgerService`. It's served as gRPC and as Connect
 | CONFLICT_RETRIES_EXHAUSTED | ABORTED | 409 | "The account was busy and the request couldn't be applied. Retry with the same Idempotency-Key." |
 | NOT_FOUND | NOT_FOUND | 404 | "No {resource} found with id {id}." |
 | INVALID_REQUEST | INVALID_ARGUMENT | 400 | Names the field and rule, e.g. "amount must be greater than 0." |
+| TRANSFER_NOT_REVERSIBLE | FAILED_PRECONDITION | 400 | Names the reason, e.g. "This transfer has already been reversed." |
 | UNAUTHENTICATED | UNAUTHENTICATED | 401 | "Missing or invalid service token." |
 
 ## 8. Rung mechanics
