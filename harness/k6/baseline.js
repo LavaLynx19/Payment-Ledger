@@ -5,7 +5,7 @@
 // capture drain after load (see run.sh's posted/s report).
 import grpc from 'k6/net/grpc';
 import { Counter } from 'k6/metrics';
-import { call, connect, fund, pick, wallets } from './lib.js';
+import { code, call, connect, fund, pick, wallets } from './lib.js';
 
 const FUNDING = Number(__ENV.FUNDING || 1_000_000_000);
 const RATE = Number(__ENV.RATE || 1000);
@@ -46,9 +46,9 @@ export default function () {
   while (dst === src) dst = pick(wallets);
 
   const res = call('CreateTransfer', { source_id: src, dest_id: dst, amount: 1 + Math.floor(Math.random() * 100) });
-  if (res.status === grpc.StatusOK) {
+  if (code(res.status) === code(grpc.StatusOK)) {
     accepted.add(1);
-  } else if (res.status === grpc.StatusFailedPrecondition) {
+  } else if (code(res.status) === code(grpc.StatusFailedPrecondition)) {
     rejected.add(1);
   } else {
     failed.add(1);
