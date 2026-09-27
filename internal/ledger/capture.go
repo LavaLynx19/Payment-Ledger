@@ -19,6 +19,7 @@ func (l *Ledger) CaptureNext(ctx context.Context) (bool, error) {
 		if err != nil || !ok {
 			return err
 		}
+		l.fail("capture.after_claim")
 		captured, err := store.MarkHoldCaptured(ctx, tx, h.ID, h.Amount)
 		if err != nil {
 			return err
@@ -29,8 +30,12 @@ func (l *Ledger) CaptureNext(ctx context.Context) (bool, error) {
 		if err := post(ctx, tx, h.TransferID, h.SourceID, h.DestID, h.Amount); err != nil {
 			return err
 		}
+		l.fail("capture.after_entries")
 		return store.SetTransferStatus(ctx, tx, h.TransferID, "posted")
 	})
+	if err == nil && found {
+		l.fail("capture.after_commit")
+	}
 	return found, err
 }
 

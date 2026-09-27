@@ -14,6 +14,7 @@ import (
 
 	"payment-ledger/internal/api"
 	"payment-ledger/internal/env"
+	"payment-ledger/internal/failpoint"
 	"payment-ledger/internal/ledger"
 	"payment-ledger/internal/store"
 )
@@ -51,9 +52,15 @@ func runServe() {
 		log.Fatalf("api: %v", err)
 	}
 	defer db.Close()
+	fp, err := failpoint.Parse(env.Or("FAILPOINTS", ""))
+	if err != nil {
+		log.Fatalf("api: FAILPOINTS: %v", err)
+	}
+	log.Printf("api: failpoints: %s", fp)
 	l, err := ledger.New(ctx, db, ledger.Config{
 		HoldTTL:     env.Duration("HOLD_TTL", 30*time.Second),
 		CASAttempts: env.Int("CAS_ATTEMPTS", 10),
+		Failpoints:  fp,
 	})
 	if err != nil {
 		log.Fatalf("api: %v", err)

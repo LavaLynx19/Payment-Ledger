@@ -126,8 +126,11 @@ func (l *Ledger) accept(ctx context.Context, typ, captureMode string, r AcceptRe
 	}
 
 	var out store.Transfer
+	var claimed bool
 	err = store.RunCAS(ctx, l.db, l.cfg.CASAttempts, func(tx pgx.Tx) error {
-		existing, claimed, err := store.ClaimIdempotencyKey(ctx, tx, r.Key, r.Hash, id)
+		var existing uuid.UUID
+		var err error
+		existing, claimed, err = store.ClaimIdempotencyKey(ctx, tx, r.Key, r.Hash, id)
 		if err != nil {
 			return err
 		}
@@ -171,7 +174,13 @@ func (l *Ledger) accept(ctx context.Context, typ, captureMode string, r AcceptRe
 		out, err = store.InsertPendingTransfer(ctx, tx, store.Transfer{
 			ID: id, Type: typ, SourceID: src.ID, DestID: dst.ID, Amount: r.Amount,
 		}, ttl, captureMode)
+		if err == nil {
+			l.fail("accept.before_commit")
+		}
 		return err
 	})
+	if err == nil && claimed {
+		l.fail("accept.after_commit")
+	}
 	return out, err
 }
