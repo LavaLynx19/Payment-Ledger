@@ -26,13 +26,13 @@ This plan covers task order, verification, and commit sequence. Requirements are
 - [x] P1.10 `retros/rung-1.md` + set TPS targets for Rungs 2-4 (update README table) → §P1
 
 ### Phase 2 — Feature completion (§P2)
-- [ ] P2.1 PlaceHold / CaptureHold (partial, remainder released) / ReleaseHold → §P2
-- [ ] P2.2 Lazy expiry in funds checks + sweeper loop + idempotency purge (24h) → §P2
-- [ ] P2.3 Withdraw → §P2
-- [ ] P2.4 ReverseTransfer: two Transfers, receivable System account, non-expiring Holds, debtor version bump → §P2
-- [ ] P2.5 Repay + RECEIVABLE_OPEN block → §P2
-- [ ] P2.6 GetBalanceAt, ListEntries (cursor), ListReceivables → §P2
-- [ ] P2.7 Checker + k6 scenarios cover Holds, Reversals, Repayments → §P2
+- [x] P2.1 PlaceHold / CaptureHold (partial, remainder released) / ReleaseHold → §P2
+- [x] P2.2 Lazy expiry in funds checks + sweeper loop + idempotency purge (24h) → §P2
+- [x] P2.3 Withdraw → §P2
+- [x] P2.4 ReverseTransfer: two Transfers, receivable System account, non-expiring Holds, debtor version bump → §P2
+- [x] P2.5 Repay + RECEIVABLE_OPEN block → §P2
+- [x] P2.6 GetBalanceAt, ListEntries (cursor), ListReceivables → §P2
+- [x] P2.7 Checker + k6 scenarios cover Holds, Reversals, Repayments → §P2
 
 ### Phase 3 — Rung 2: crash mid-Transfer (§P3)
 - [ ] P3.1 `internal/failpoint`: env-gated named crash points → §P3

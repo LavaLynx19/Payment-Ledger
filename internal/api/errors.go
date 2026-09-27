@@ -57,6 +57,12 @@ func ErrInvalidRequest(msg string) *connect.Error {
 	return newError(connect.CodeInvalidArgument, ledgerv1.ErrorDetail_REASON_INVALID_REQUEST, msg)
 }
 
+// ErrTransferNotReversible takes a message that names the reason, e.g. "This
+// transfer has already been reversed."
+func ErrTransferNotReversible(msg string) *connect.Error {
+	return newError(connect.CodeFailedPrecondition, ledgerv1.ErrorDetail_REASON_TRANSFER_NOT_REVERSIBLE, msg)
+}
+
 func ErrUnauthenticated() *connect.Error {
 	return newError(connect.CodeUnauthenticated, ledgerv1.ErrorDetail_REASON_UNAUTHENTICATED,
 		"Missing or invalid service token.")
@@ -70,12 +76,24 @@ func toConnect(err error) error {
 		insufficient *ledger.InsufficientFundsError
 		notFound     *ledger.NotFoundError
 		inv          *ledger.InvalidError
+		notActive    *ledger.HoldNotActiveError
+		expired      *ledger.HoldExpiredError
+		irreversible *ledger.NotReversibleError
+		owes         *ledger.ReceivableOpenError
 	)
 	switch {
 	case errors.As(err, &cerr):
 		return cerr
+	case errors.As(err, &owes):
+		return ErrReceivableOpen(owes.Owed)
+	case errors.As(err, &irreversible):
+		return ErrTransferNotReversible(irreversible.Msg)
 	case errors.As(err, &insufficient):
 		return ErrInsufficientFunds(insufficient.Available, insufficient.Amount)
+	case errors.As(err, &notActive):
+		return ErrHoldNotActive(notActive.Status)
+	case errors.As(err, &expired):
+		return ErrHoldExpired(expired.ExpiresAt)
 	case errors.As(err, &notFound):
 		return ErrNotFound(notFound.Resource, notFound.ID)
 	case errors.As(err, &inv):

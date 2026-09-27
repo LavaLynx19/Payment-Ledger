@@ -28,6 +28,7 @@ func TestErrorTable(t *testing.T) {
 		{ErrNotFound("transfer", "x"), connect.CodeNotFound, ledgerv1.ErrorDetail_REASON_NOT_FOUND},
 		{ErrUnauthenticated(), connect.CodeUnauthenticated, ledgerv1.ErrorDetail_REASON_UNAUTHENTICATED},
 		{ErrInvalidRequest("amount must be greater than 0."), connect.CodeInvalidArgument, ledgerv1.ErrorDetail_REASON_INVALID_REQUEST},
+		{ErrTransferNotReversible("This transfer has already been reversed."), connect.CodeFailedPrecondition, ledgerv1.ErrorDetail_REASON_TRANSFER_NOT_REVERSIBLE},
 	}
 	for _, c := range cases {
 		if c.err.Code() != c.code {
@@ -44,14 +45,14 @@ func TestAuth(t *testing.T) {
 	defer srv.Close()
 	client := ledgerv1connect.NewLedgerServiceClient(http.DefaultClient, srv.URL)
 
-	// ListReceivables stays unimplemented until P2.6, so a valid token reaching it
-	// proves auth passed without needing a ledger.
+	// A malformed id fails validation in the handler before the ledger is
+	// used, so reaching that error proves auth passed without needing a ledger.
 	call := func(token string) error {
-		req := connect.NewRequest(&ledgerv1.ListReceivablesRequest{})
+		req := connect.NewRequest(&ledgerv1.GetTransferRequest{Id: "not-a-uuid"})
 		if token != "" {
 			req.Header().Set("Authorization", "Bearer "+token)
 		}
-		_, err := client.ListReceivables(context.Background(), req)
+		_, err := client.GetTransfer(context.Background(), req)
 		return err
 	}
 
@@ -60,9 +61,8 @@ func TestAuth(t *testing.T) {
 			t.Errorf("token %q: code = %v, want unauthenticated", tok, code)
 		}
 	}
-	// A valid token passes auth and reaches the not-yet-built handler.
-	if code := connect.CodeOf(call("good")); code != connect.CodeUnimplemented {
-		t.Errorf("valid token: code = %v, want unimplemented", code)
+	if code := connect.CodeOf(call("good")); code != connect.CodeInvalidArgument {
+		t.Errorf("valid token: code = %v, want invalid argument from the handler", code)
 	}
 }
 

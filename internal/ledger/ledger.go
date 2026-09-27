@@ -17,13 +17,18 @@ import (
 
 // Transfer types, matching transfers.type.
 const (
-	TypeP2P   = "p2p"
-	TypeTopUp = "topup"
+	TypeP2P        = "p2p"
+	TypeTopUp      = "topup"
+	TypeWithdrawal = "withdrawal"
+	TypeReversal   = "reversal"
+	TypeReceivable = "receivable"
+	TypeRepayment  = "repayment"
 )
 
 type Config struct {
-	HoldTTL     time.Duration // default expiry for client-initiated Holds
-	CASAttempts int           // tx attempts before CONFLICT_RETRIES_EXHAUSTED
+	HoldTTL      time.Duration // default expiry for client-initiated Holds
+	CASAttempts  int           // tx attempts before CONFLICT_RETRIES_EXHAUSTED
+	KeyRetention time.Duration // how long idempotency keys are kept (A§2.7: 24h)
 }
 
 type Ledger struct {
@@ -50,6 +55,11 @@ type InsufficientFundsError struct{ Available, Amount int64 }
 func (e *InsufficientFundsError) Error() string {
 	return fmt.Sprintf("insufficient funds: available %d < amount %d", e.Available, e.Amount)
 }
+
+// ReceivableOpenError blocks a debit from a Wallet that still owes Owed.
+type ReceivableOpenError struct{ Owed int64 }
+
+func (e *ReceivableOpenError) Error() string { return fmt.Sprintf("receivable open: owes %d", e.Owed) }
 
 type NotFoundError struct{ Resource, ID string }
 
