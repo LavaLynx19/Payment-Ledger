@@ -31,7 +31,7 @@ func testLedger(t *testing.T) *Ledger {
 	if _, err := store.EnsureFundingAccount(ctx, db); err != nil {
 		t.Fatal(err)
 	}
-	l, err := New(ctx, db, Config{HoldTTL: time.Minute, CASAttempts: 10})
+	l, err := New(ctx, db, Config{HoldTTL: time.Minute, CASAttempts: 10, KeyRetention: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,10 +49,11 @@ func wallets(t *testing.T, l *Ledger, n int) []uuid.UUID {
 
 func key() string { return "test-" + uuid.NewString() }
 
-// drain captures until no capturable (active, unexpired) Hold remains.
+// drain captures until no capturable (active, unexpired, auto) Hold remains.
 // CaptureNext skips Holds locked by another capturer (SKIP LOCKED), so
 // "nothing claimed" alone doesn't mean the other capturer's work has
-// committed. Expired Holds are ignored: only the sweeper (P2.2) finalizes them.
+// committed. Expired Holds are ignored (only the sweeper finalizes them), and
+// so are manual Holds (only their caller does).
 func drain(t *testing.T, l *Ledger) {
 	t.Helper()
 	ctx := context.Background()
@@ -67,7 +68,9 @@ func drain(t *testing.T, l *Ledger) {
 		}
 		var active int
 		if err := l.db.QueryRow(ctx,
-			`SELECT count(*) FROM holds WHERE status = 'active' AND (expires_at IS NULL OR expires_at > clock_timestamp())`,
+			`SELECT count(*) FROM holds
+			 WHERE status = 'active' AND capture_mode = 'auto'
+			   AND (expires_at IS NULL OR expires_at > clock_timestamp())`,
 		).Scan(&active); err != nil {
 			t.Fatal(err)
 		}
@@ -232,6 +235,35 @@ func TestAcceptIsIdempotent(t *testing.T) {
 	req.Hash = []byte("h2")
 	if _, err := l.CreateTransfer(ctx, req); !errors.Is(err, ErrIdempotencyMismatch) {
 		t.Errorf("mismatch err = %v, want ErrIdempotencyMismatch", err)
+	}
+}
+
+func TestWithdraw(t *testing.T) {
+	l := testLedger(t)
+	ctx := context.Background()
+	w := wallets(t, l, 1)[0]
+	fund(t, l, w, 100)
+	fundingBefore := balance(t, l, l.fundingID).Posted
+
+	if _, err := l.Withdraw(ctx, key(), []byte("h"), w, 70); err != nil {
+		t.Fatal(err)
+	}
+	var insufficient *InsufficientFundsError
+	if _, err := l.Withdraw(ctx, key(), []byte("h"), w, 31); !errors.As(err, &insufficient) {
+		t.Errorf("overdraw err = %v, want insufficient funds", err)
+	}
+	drain(t, l)
+	if got := balance(t, l, w).Posted; got != 30 {
+		t.Errorf("wallet posted = %d, want 30", got)
+	}
+	// Funding is debit-normal (simulated cash at bank), so a Withdrawal credits it down.
+	if got := balance(t, l, l.fundingID).Posted; got != fundingBefore-70 {
+		t.Errorf("funding posted = %d, want %d", got, fundingBefore-70)
+	}
+
+	var inv *InvalidError
+	if _, err := l.Withdraw(ctx, key(), []byte("h"), l.fundingID, 1); !errors.As(err, &inv) {
+		t.Errorf("withdraw from funding err = %v, want InvalidError", err)
 	}
 }
 

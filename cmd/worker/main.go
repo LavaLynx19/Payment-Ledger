@@ -1,6 +1,7 @@
-// Command worker captures PENDING Transfers (A§5 Capture). Each goroutine
-// claims Holds with FOR UPDATE SKIP LOCKED, so any number of goroutines and
-// processes can run side by side.
+// Command worker runs the background loops: capture of PENDING Transfers
+// (A§5 Capture) and the sweeper that finalizes expired Holds and purges old
+// idempotency keys. Capture goroutines claim Holds with FOR UPDATE SKIP
+// LOCKED, so any number of goroutines and processes can run side by side.
 package main
 
 import (
@@ -26,19 +27,24 @@ func main() {
 		log.Fatalf("worker: %v", err)
 	}
 	defer db.Close()
-	l, err := ledger.New(ctx, db, ledger.Config{CASAttempts: env.Int("CAS_ATTEMPTS", 10)})
+	l, err := ledger.New(ctx, db, ledger.Config{
+		CASAttempts:  env.Int("CAS_ATTEMPTS", 10),
+		KeyRetention: env.Duration("IDEMPOTENCY_RETENTION", 24*time.Hour),
+	})
 	if err != nil {
 		log.Fatalf("worker: %v", err)
 	}
 
 	concurrency := env.Int("WORKER_CONCURRENCY", 4)
 	poll := env.Duration("WORKER_POLL", 20*time.Millisecond)
-	log.Printf("worker: %d capture loops, idle poll %s", concurrency, poll)
+	sweepEvery := env.Duration("SWEEP_INTERVAL", time.Second)
+	log.Printf("worker: %d capture loops (idle poll %s), sweeper every %s", concurrency, poll, sweepEvery)
 
 	var wg sync.WaitGroup
 	for range concurrency {
 		wg.Go(func() { captureLoop(ctx, l, poll) })
 	}
+	wg.Go(func() { sweepLoop(ctx, l, sweepEvery) })
 	wg.Wait()
 }
 
@@ -53,9 +59,26 @@ func captureLoop(ctx context.Context, l *ledger.Ledger, poll time.Duration) {
 		if found && err == nil {
 			continue
 		}
-		select {
-		case <-ctx.Done():
-		case <-time.After(poll):
+		sleep(ctx, poll)
+	}
+}
+
+func sweepLoop(ctx context.Context, l *ledger.Ledger, every time.Duration) {
+	for ctx.Err() == nil {
+		expired, purged, err := l.Sweep(ctx)
+		if err != nil && ctx.Err() == nil {
+			log.Printf("worker: sweep: %v", err)
 		}
+		if expired > 0 || purged > 0 {
+			log.Printf("worker: sweep expired %d holds, purged %d idempotency keys", expired, purged)
+		}
+		sleep(ctx, every)
+	}
+}
+
+func sleep(ctx context.Context, d time.Duration) {
+	select {
+	case <-ctx.Done():
+	case <-time.After(d):
 	}
 }
