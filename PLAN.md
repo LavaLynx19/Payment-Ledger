@@ -35,13 +35,14 @@ This plan covers task order, verification, and commit sequence. Requirements are
 - [x] P2.7 Checker + k6 scenarios cover Holds, Reversals, Repayments → §P2
 
 ### Phase 3 — Rung 2: crash mid-Transfer (§P3)
-- [ ] P3.1 `internal/failpoint`: env-gated named crash points → §P3
-- [ ] P3.2 Wire all 10 failpoints from A§5 → §P3
-- [ ] P3.3 `harness/faults/`: per-failpoint runs + random kill -9 of api/worker/postgres under load → §P3
-- [ ] P3.4 k6 client retries with the same Idempotency-Key on errors/timeouts → §P3
-- [ ] P3.5 Run to target; fix findings; `retros/rung-2.md` → §P3
+- [x] P3.1 `internal/failpoint`: env-gated named crash points → §P3
+- [x] P3.2 Wire all 10 failpoints from A§5 → §P3
+- [x] P3.3 `harness/faults/`: per-failpoint runs + random kill -9 of api/worker/postgres under load → §P3
+- [x] P3.4 k6 client retries with the same Idempotency-Key on errors/timeouts → §P3
+- [x] P3.5 Run to target; fix findings; `retros/rung-2.md` → §P3
 
 ### Phase 4 — Rung 3: hot Account contention (§P4)
+- [ ] P4.0 Re-measure Rung 2 fault-free p99 and the Rung 1 baseline on a cool machine (Rung 2 p99 miss accepted with a note) → §P4
 - [ ] P4.1 `harness/k6/rung3.js`: skewed traffic on funding account + popular destination; record retries + p99 → §P4
 - [>] P4.2 Hot-Account strategy (design + Decision Log entry) → defer until: P4.1 measurements exist
 - [>] P4.3 Implement strategy, rerun to target, `retros/rung-3.md` → defer until: P4.2 approved
