@@ -92,16 +92,27 @@ if [[ -n "$FAILPOINTS" ]]; then
        "worker $(docker inspect -f '{{.RestartCount}}' payment-ledger-worker-1)"
 fi
 
-step "drain pending captures"
+step "drain pending captures and saga relays"
+# Pending work across every shard: auto Holds not yet captured, plus saga
+# credits not yet relayed (A§9.5).
+pending() {
+  local total=0 n
+  for db in "${DBS[@]}"; do
+    n=$("${COMPOSE[@]}" exec -T "$db" psql -U ledger -d ledger -tA -c \
+      "SELECT (SELECT count(*) FROM holds WHERE status = 'active' AND capture_mode = 'auto') + (SELECT count(*) FROM outbox)")
+    total=$((total + n))
+  done
+  echo "$total"
+}
 start=$(date +%s)
-active=$(psql -c "SELECT count(*) FROM holds WHERE status = 'active' AND capture_mode = 'auto'")
-echo "auto holds active when load stopped: $active"
+active=$(pending)
+echo "pending when load stopped: $active"
 deadline=$((start + ${DRAIN_TIMEOUT:-120}))
 while [[ "$active" != "0" && $(date +%s) -lt $deadline ]]; do
   sleep 0.5
-  active=$(psql -c "SELECT count(*) FROM holds WHERE status = 'active' AND capture_mode = 'auto'")
+  active=$(pending)
 done
-echo "drain took $(( $(date +%s) - start ))s; auto holds remaining: $active"
+echo "drain took $(( $(date +%s) - start ))s; pending remaining: $active"
 
 step "transfers (p2p)"
 psql -F ' ' -c "SELECT status, count(*) FROM transfers WHERE type = 'p2p' GROUP BY status ORDER BY status"

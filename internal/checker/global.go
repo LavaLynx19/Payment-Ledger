@@ -19,6 +19,7 @@ type view struct {
 	holds     map[uuid.UUID]hold   // by transfer id
 	nets      map[uuid.UUID]netSum // by transfer id, summed across shards
 	keys      map[string]uuid.UUID // idempotency key → transfer id
+	inFlight  map[uuid.UUID]int64  // saga outbox: transfer id → credit not yet relayed
 }
 
 type transfer struct {
@@ -49,7 +50,8 @@ func (v *view) transferAt(id uuid.UUID) (transfer, bool) {
 }
 
 func load(ctx context.Context, shards []store.Querier) (*view, error) {
-	v := &view{n: len(shards), holds: map[uuid.UUID]hold{}, nets: map[uuid.UUID]netSum{}, keys: map[string]uuid.UUID{}}
+	v := &view{n: len(shards), holds: map[uuid.UUID]hold{}, nets: map[uuid.UUID]netSum{},
+		keys: map[string]uuid.UUID{}, inFlight: map[uuid.UUID]int64{}}
 	for i, q := range shards {
 		accounts := map[uuid.UUID]bool{}
 		if err := each(ctx, q, `SELECT id FROM accounts`, func(r pgx.Rows) error {
@@ -98,6 +100,16 @@ func load(ctx context.Context, shards []store.Querier) (*view, error) {
 			return nil, fmt.Errorf("shard %d entries: %w", i, err)
 		}
 
+		if err := each(ctx, q, `SELECT transfer_id, amount FROM outbox`, func(r pgx.Rows) error {
+			var id uuid.UUID
+			var amount int64
+			err := r.Scan(&id, &amount)
+			v.inFlight[id] = amount
+			return err
+		}); err != nil {
+			return nil, fmt.Errorf("shard %d outbox: %w", i, err)
+		}
+
 		if err := each(ctx, q, `SELECT key, transfer_id FROM idempotency_keys`, func(r pgx.Rows) error {
 			var k string
 			var id uuid.UUID
@@ -131,6 +143,11 @@ func runGlobal(ctx context.Context, shards []store.Querier) ([]Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	return v.evaluate(), nil
+}
+
+// evaluate runs the global checks on a loaded view.
+func (v *view) evaluate() []Result {
 	ledger := Result{Check: Check{Invariant: 1, Name: "ledger balanced (Σ debits = Σ credits)"}}
 	perTransfer := Result{Check: Check{Invariant: 1, Name: "each transfer balanced"}}
 	posted := Result{Check: Check{Invariant: 5, Name: "posted transfers have entries; others have none"}}
@@ -138,18 +155,23 @@ func runGlobal(ctx context.Context, shards []store.Querier) ([]Result, error) {
 	reversals := Result{Check: Check{Invariant: 7, Name: "reversals return exactly the posted amount, once"}}
 	refs := Result{Check: Check{Invariant: 8, Name: "cross-shard references resolve"}}
 
-	var total int64
+	// A saga credit still in the outbox leaves its Transfer, and the ledger,
+	// off by exactly that amount until the relay applies it (A§9.5).
+	var total, inFlight int64
+	for _, amount := range v.inFlight {
+		inFlight += amount
+	}
 	for id, s := range v.nets {
 		total += s.net
-		if s.net != 0 {
-			perTransfer.add(fmt.Sprintf("transfer %s off by %d", id, s.net))
+		if off := s.net - v.inFlight[id]; off != 0 {
+			perTransfer.add(fmt.Sprintf("transfer %s off by %d (in flight %d)", id, off, v.inFlight[id]))
 		}
 		if _, ok := v.transferAt(id); !ok {
 			refs.add(fmt.Sprintf("entries reference missing transfer %s", id))
 		}
 	}
-	if total != 0 {
-		ledger.add(fmt.Sprintf("ledger off by %d", total))
+	if total != inFlight {
+		ledger.add(fmt.Sprintf("ledger off by %d (in flight %d)", total-inFlight, inFlight))
 	}
 
 	type revTotal struct{ sum, reversals, receivables int }
@@ -202,5 +224,5 @@ func runGlobal(ctx context.Context, shards []store.Querier) ([]Result, error) {
 			keys.add(fmt.Sprintf("key %s points at missing transfer %s", k, id))
 		}
 	}
-	return []Result{ledger, perTransfer, posted, keys, reversals, refs}, nil
+	return []Result{ledger, perTransfer, posted, keys, reversals, refs}
 }

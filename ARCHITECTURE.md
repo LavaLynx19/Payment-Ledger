@@ -420,9 +420,14 @@ A Hold's debit lives on its source shard S and its credit on the destination's s
 - Postgres needs `max_prepared_transactions` > 0 (P5.2).
 
 ### 9.5 Saga variant (comparison only, `CROSS_SHARD=saga`)
-- **Leg 1, on S:** capture posts the debit and writes an `outbox (transfer_id, dest, amount)` row in the same tx.
-- **Leg 2, on D:** a relay applies the credit, idempotent by `transfer_id` through a unique `(transfer_id, direction)` on Entries, then deletes the outbox row.
-- **Relaxations, documented and measured:** the recipient is credited after the sender is debited, and the ledger is globally unbalanced by the outbox total while legs are in flight. Its checker counts outbox rows as in-flight credits, so invariant 1 becomes "debits = credits + in-flight". The default stays 2PC.
+**Scope:** only the worker's **capture posting** switches. Key placement (Accept, Release, CaptureHold) and the Reversal lock stay on 2PC in both modes, because they need atomicity for exactly-once guarantees, not just for balance. So the comparison is "posting via 2PC vs via saga". Manual CaptureHold also keeps 2PC.
+
+- **Leg 1, on S:** the capture batch posts every debit, posts the credits whose destination is also on S, and writes an `outbox (transfer_id PK, dest_id, amount)` row for each credit whose destination lives on another shard. All in one **local** tx, with no 2PC. The Transfer becomes `posted` here, when its debit lands.
+- **Leg 2, on D:** a relay (a worker loop) claims outbox rows on S (`FOR UPDATE SKIP LOCKED`) and, per destination shard, applies the credits in one local tx through the same netted posting as §5. It skips any Transfer already credited there, with a unique `(transfer_id, direction)` on Entries as the backstop. Only then does it delete the claimed outbox rows on S. A crash between the two (failpoint `saga.after_credit`) leaves the outbox row, and the next relay finds the credit already applied and just deletes it. Each credit is applied exactly once.
+- **Relaxations, documented and measured:** the recipient is credited after the sender is debited, and the ledger is globally unbalanced by the outbox total while legs are in flight.
+  - The **checker** counts outbox rows as in-flight credits: a Transfer with an outbox row is expected to net its amount, and the ledger to net Σ outbox.
+  - The **harness drain** waits for the outbox to empty, so post-drain checks are strict.
+- **Counters:** `saga.outbox_written`, `saga.relayed`, `saga.already_applied`. The default stays 2PC.
 
 ### 9.6 Reads and the checker
 - **Routing:** GetTransfer, GetBalance and GetBalanceAt route by id. ListEntries routes by account. ListReceivables fans out to every shard and merges by debtor id.

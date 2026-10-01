@@ -38,7 +38,15 @@ type Config struct {
 	// PrepareTimeout is how long a 2PC may sit prepared with no decision
 	// before the resolver aborts it (A§9.4).
 	PrepareTimeout time.Duration
+	// CrossShard is how capture posts a credit on another shard: CrossShard2PC
+	// (default) or CrossShardSaga (A§9.5).
+	CrossShard string
 }
+
+const (
+	CrossShard2PC  = "2pc"
+	CrossShardSaga = "saga"
+)
 
 // Resolve finishes in-doubt 2PC writes on every shard (A§9.4).
 func (l *Ledger) Resolve(ctx context.Context) (committed, rolledBack int, err error) {

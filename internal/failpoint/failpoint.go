@@ -26,6 +26,7 @@ func Names() []string {
 		"reversal.before_commit", "reversal.after_commit",
 		"twopc.after_first_prepare", "twopc.after_all_prepared",
 		"twopc.after_decision", "twopc.after_first_commit",
+		"saga.after_credit",
 	}
 }
 

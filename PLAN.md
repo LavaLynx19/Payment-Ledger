@@ -59,7 +59,7 @@ This plan covers task order, verification, and commit sequence. Requirements are
 - [x] P5.6 2PC Capture: one cross-shard write per claimed batch (A§9.3) → §P5
 - [x] P5.7 Resolver (presumed abort) + `twopc.*` failpoints + counters → §P5
 - [x] P5.8 Checker: per-shard invariants 2-7, global invariant 1, no prepared tx left → §P5
-- [ ] P5.9 Saga variant (`CROSS_SHARD=saga`): outbox, relay, Entry `(transfer_id, direction)` unique, saga-aware checker → §P5
+- [x] P5.9 Saga variant (`CROSS_SHARD=saga`): outbox, relay, Entry `(transfer_id, direction)` unique, saga-aware checker → §P5
 - [ ] P5.10 TigerBeetle engine core (`LEDGER_ENGINE=tigerbeetle`): Accounts, Transfers, Holds, reads; Linux-container tests → §P5
 - [ ] P5.11 TigerBeetle Receivable rules: debit-block chain, reversal shortfall chain, repay (from `prototypes/tb-gaps`) → §P5
 - [ ] P5.12 Measure 2PC vs saga vs TigerBeetle (baseline, hot runs, fault matrix incl. toxiproxy), `retros/rung-4.md` → §P5

@@ -59,16 +59,31 @@ func (l *Ledger) captureBatchOn(ctx context.Context, i, max int) (int, error) {
 		}
 		var posted, failed []uuid.UUID
 		var legs []leg
+		var outbox []store.OutboxRow
 		for _, h := range holds {
 			if !won[h.ID] { // expiry committed first
 				failed = append(failed, h.TransferID)
 				continue
 			}
 			posted = append(posted, h.TransferID)
+			if l.cfg.CrossShard == CrossShardSaga && l.shardOf(h.DestID) != i {
+				// Saga (A§9.5): debit now, relay the credit to its shard later.
+				legs = append(legs, leg{h.TransferID, h.SourceID, "debit", h.Amount})
+				outbox = append(outbox, store.OutboxRow{TransferID: h.TransferID, DestID: h.DestID, Amount: h.Amount})
+				continue
+			}
 			legs = append(legs, transferLegs(h.TransferID, h.SourceID, h.DestID, h.Amount)...)
 		}
 		if err := postLegs(ctx, x, legs); err != nil {
 			return err
+		}
+		if len(outbox) > 0 {
+			if err := store.InsertOutbox(ctx, tx, outbox); err != nil {
+				return err
+			}
+			if l.cfg.CASStats != nil {
+				l.cfg.CASStats.Add("saga.outbox_written", int64(len(outbox)))
+			}
 		}
 		x.SetHome(holds[0].TransferID)
 		l.fail("capture.after_entries")
