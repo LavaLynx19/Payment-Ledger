@@ -31,7 +31,7 @@ func testLedger(t *testing.T) *Ledger {
 	if _, err := store.EnsureFundingAccount(ctx, db); err != nil {
 		t.Fatal(err)
 	}
-	l, err := New(ctx, db, Config{HoldTTL: time.Minute, CASAttempts: 10, KeyRetention: time.Hour})
+	l, err := New(ctx, store.NewShards(db), Config{HoldTTL: time.Minute, CASAttempts: 10, KeyRetention: time.Hour})
 	if err != nil {
 		t.Fatal(err)
 	}

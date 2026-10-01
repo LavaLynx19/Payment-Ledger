@@ -43,12 +43,14 @@ func (l *Ledger) runCAS(ctx context.Context, op string, fn func(pgx.Tx) error) e
 }
 
 type Ledger struct {
-	db        *pgxpool.Pool
+	shards    *store.Shards
+	db        *pgxpool.Pool // shard 0: write paths until cross-shard Accept/Capture (P5.5–P5.6)
 	cfg       Config
 	fundingID uuid.UUID
 }
 
-func New(ctx context.Context, db *pgxpool.Pool, cfg Config) (*Ledger, error) {
+func New(ctx context.Context, shards *store.Shards, cfg Config) (*Ledger, error) {
+	db := shards.Pool(0)
 	fundingID, err := store.FundingAccountID(ctx, db)
 	if errors.Is(err, store.ErrAccountNotFound) {
 		return nil, errors.New("funding account missing; run cmd/seed first")
@@ -56,7 +58,7 @@ func New(ctx context.Context, db *pgxpool.Pool, cfg Config) (*Ledger, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Ledger{db: db, cfg: cfg, fundingID: fundingID}, nil
+	return &Ledger{shards: shards, db: db, cfg: cfg, fundingID: fundingID}, nil
 }
 
 // Domain errors. internal/api maps each one to its A§7 reason.

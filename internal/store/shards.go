@@ -32,6 +32,11 @@ func OpenShards(ctx context.Context, urls []string) (*Shards, error) {
 	return s, nil
 }
 
+// NewShards wraps already-open pools, in shard-index order. Close closes them.
+func NewShards(pools ...*pgxpool.Pool) *Shards {
+	return &Shards{pools: pools}
+}
+
 // MigrateAll applies pending migrations to every shard.
 func MigrateAll(ctx context.Context, urls []string) error {
 	for i, u := range urls {

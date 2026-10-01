@@ -35,14 +35,13 @@ func main() {
 	if shards.N() > 1 {
 		log.Fatalf("%s: %d shards configured; multi-shard ledger operations arrive in P5.5–P5.6", "worker", shards.N())
 	}
-	db := shards.Pool(0)
 	fp, err := failpoint.Parse(env.Or("FAILPOINTS", ""))
 	if err != nil {
 		log.Fatalf("worker: FAILPOINTS: %v", err)
 	}
 	log.Printf("worker: failpoints: %s", fp)
 	cas := expvar.NewMap("cas")
-	l, err := ledger.New(ctx, db, ledger.Config{
+	l, err := ledger.New(ctx, shards, ledger.Config{
 		CASAttempts:  env.Int("CAS_ATTEMPTS", 10),
 		KeyRetention: env.Duration("IDEMPOTENCY_RETENTION", 24*time.Hour),
 		Failpoints:   fp,
