@@ -52,7 +52,7 @@ This plan covers task order, verification, and commit sequence. Requirements are
 
 ### Phase 5 — Rung 4: sharding + cross-shard (§P5)
 - [x] P5.1 Shard key + cross-shard protocol + strict-reads vs never-negative decision (ARCH update, A§9) → §P5
-- [ ] P5.2 Compose: 2 Postgres shards (`max_prepared_transactions`), TigerBeetle (named volume, seccomp), toxiproxy — ask-first → §P5
+- [x] P5.2 Compose: 2 Postgres shards (`max_prepared_transactions`), TigerBeetle (named volume, seccomp), toxiproxy — ask-first → §P5
 - [ ] P5.3 Shard routing: UUIDv7 shard bits, one pool per shard, migrate all shards, seed per-shard funding + round-robin Wallets → §P5
 - [ ] P5.4 Routed reads + ListReceivables fan-out → §P5
 - [ ] P5.5 2PC Accept: key on `hash(key)` shard, `decisions` table migration → §P5
