@@ -26,7 +26,7 @@ func (l *Ledger) ReverseTransfer(ctx context.Context, key string, hash []byte, t
 		return nil, nil, err
 	}
 	var claimed bool
-	err = store.RunCAS(ctx, l.db, l.cfg.CASAttempts, func(tx pgx.Tx) error {
+	err = l.runCAS(ctx, "reverse", func(tx pgx.Tx) error {
 		reversal, receivable = nil, nil
 		orig, err := store.LockTransfer(ctx, tx, transferID)
 		if errors.Is(err, store.ErrTransferNotFound) {

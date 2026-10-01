@@ -34,6 +34,12 @@ type Config struct {
 	CASAttempts  int            // tx attempts before CONFLICT_RETRIES_EXHAUSTED
 	KeyRetention time.Duration  // how long idempotency keys are kept (A§2.7: 24h)
 	Failpoints   *failpoint.Set // Rung 2 crash points; nil disables all
+	CASStats     store.Counter  // per-op CAS attempts/conflicts/exhausted; nil disables
+}
+
+// runCAS runs fn as one CAS tx with retries, counting outcomes under op.
+func (l *Ledger) runCAS(ctx context.Context, op string, fn func(pgx.Tx) error) error {
+	return store.RunCAS(ctx, l.db, l.cfg.CASAttempts, l.cfg.CASStats, op, fn)
 }
 
 type Ledger struct {

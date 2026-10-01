@@ -127,7 +127,7 @@ func (l *Ledger) accept(ctx context.Context, typ, captureMode string, r AcceptRe
 
 	var out store.Transfer
 	var claimed bool
-	err = store.RunCAS(ctx, l.db, l.cfg.CASAttempts, func(tx pgx.Tx) error {
+	err = l.runCAS(ctx, "accept", func(tx pgx.Tx) error {
 		var existing uuid.UUID
 		var err error
 		existing, claimed, err = store.ClaimIdempotencyKey(ctx, tx, r.Key, r.Hash, id)
@@ -164,11 +164,17 @@ func (l *Ledger) accept(ctx context.Context, typ, captureMode string, r AcceptRe
 			}
 		}
 
-		// Bump the source's version even though posted doesn't change: a
+		// Bump a Wallet source's version even though posted doesn't change: a
 		// concurrent Accept that read the same funds now conflicts, retries,
-		// and sees this Hold (Decision Log → "Placing a Hold bumps the Account version").
-		if _, _, err := store.CASAccount(ctx, tx, src.ID, src.Version, 0); err != nil {
-			return err
+		// and sees this Hold (Decision Log → "Placing a Hold bumps the Account
+		// version"). System sources have no funds check to protect, so they
+		// skip the bump, which keeps the hot funding row out of every TopUp's
+		// CAS (Decision Log → "Rung 3: version checks only where a funds check
+		// needs them").
+		if src.Kind == "wallet" {
+			if _, _, err := store.CASAccount(ctx, tx, src.ID, src.Version, 0); err != nil {
+				return err
+			}
 		}
 
 		out, err = store.InsertPendingTransfer(ctx, tx, store.Transfer{
