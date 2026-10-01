@@ -26,14 +26,14 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	db, err := store.Open(ctx, env.Must("DATABASE_URL"))
+	shards, err := store.OpenShards(ctx, env.ShardURLs())
 	if err != nil {
 		log.Fatalf("checker: %v", err)
 	}
-	defer db.Close()
+	defer shards.Close()
 
 	for {
-		results, err := checker.Snapshot(ctx, db)
+		results, err := checker.Snapshot(ctx, shards)
 		if err != nil {
 			log.Fatalf("checker: %v", err)
 		}

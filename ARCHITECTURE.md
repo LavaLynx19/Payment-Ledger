@@ -223,6 +223,7 @@ idempotency_keys(
 5. Every posted Transfer has exactly one captured Hold, and its Entries post exactly the Hold's `captured_amount`. `transfers.amount` stays the requested amount. No Hold is both captured and expired.
 6. Every idempotency key maps to exactly one Transfer.
 7. A reversed Transfer has at most one reversal and one receivable Transfer, and their amounts sum to its posted amount. A receivable System account never goes below zero, now or in its history, so no Receivable is ever overpaid.
+8. (Rung 4) Every reference that can cross shards resolves on the shard its id routes to: `transfers.dest_id`, `holds.dest_id`, `entries.transfer_id`, `transfers.reverses_id`, `idempotency_keys.transfer_id`. No 2PC is left in doubt: no prepared tx remains once the ledger is idle.
 
 ## 5. Write paths
 
@@ -425,7 +426,11 @@ A Hold's debit lives on its source shard S and its credit on the destination's s
 
 ### 9.6 Reads and the checker
 - **Routing:** GetTransfer, GetBalance and GetBalanceAt route by id. ListEntries routes by account. ListReceivables fans out to every shard and merges by debtor id.
-- **Checker:** runs per shard (invariants 2-7), plus a global invariant 1 summed across shards. As today, it runs after the drain, when no 2PC is in flight. A prepared tx left behind is itself a violation. It also verifies every reference whose FK was dropped (§9.2): each `dest_id`, Entry `transfer_id`, `reverses_id` and idempotency `transfer_id` resolves on the shard its id routes to.
+- **Checker:** two kinds of check.
+  - **Local:** SQL run on each shard. Invariants 2, 3 and 4; invariant 5's Hold half; receivables-never-overpaid from 7; and invariant 8's "no prepared tx".
+  - **Global:** checks whose rows span shards. The ledger and per-Transfer balance (1), "posted ⇔ has Entries" (5), keys → Transfers (6), reversal totals (7), and every cross-shard reference (8). These are computed in Go from a compact projection read off every shard.
+
+  Each shard is read in its own read-only REPEATABLE READ snapshot. Together they're consistent only while the ledger is idle, so the checker runs after the drain, as the harness already does. With one shard, every check means exactly what it did before.
 
 ### 9.7 TigerBeetle backend (`LEDGER_ENGINE=tigerbeetle`)
 The same API runs on a single-replica TigerBeetle, which isn't sharded: the comparison is **sharded Postgres vs one TigerBeetle**. It has full API parity using native mechanisms only, with the two gaps proven atomic by `prototypes/tb-gaps` (Decision Log → *TigerBeetle gaps close with linked chains*).

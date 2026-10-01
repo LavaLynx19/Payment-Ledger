@@ -55,6 +55,24 @@ func TestChecksDetectCorruption(t *testing.T) {
 			_, err := tx.Exec(ctx, `UPDATE accounts SET posted = posted + 1 WHERE id = $1`, w)
 			return err
 		}},
+		// Global checks (A§9.6), computed across shards in Go.
+		{"each transfer balanced", func(tx pgx.Tx, w uuid.UUID) error {
+			if err := postPair(ctx, tx, w, 50); err != nil {
+				return err
+			}
+			_, err := tx.Exec(ctx, `UPDATE entries SET amount = amount + 1 WHERE account_id = $1`, w)
+			return err
+		}},
+		{"cross-shard references resolve", func(tx pgx.Tx, w uuid.UUID) error {
+			_, err := tx.Exec(ctx, `INSERT INTO entries (id, transfer_id, account_id, direction, amount, balance_after, account_version, created_at)
+				VALUES ($1, $2, $3, 'credit', 1, 1, 999, clock_timestamp())`, uuid.New(), uuid.New(), w)
+			return err
+		}},
+		{"each idempotency key maps to an existing transfer", func(tx pgx.Tx, w uuid.UUID) error {
+			_, err := tx.Exec(ctx, `INSERT INTO idempotency_keys (key, request_hash, transfer_id) VALUES ($1, 'h', $2)`,
+				"checker-"+uuid.NewString(), uuid.New())
+			return err
+		}},
 	}
 	for _, c := range cases {
 		t.Run(c.check, func(t *testing.T) {
@@ -67,7 +85,7 @@ func TestChecksDetectCorruption(t *testing.T) {
 				if err := c.corrupt(tx, w[0]); err != nil {
 					t.Fatal(err)
 				}
-				results, err := Run(ctx, tx)
+				results, err := Run(ctx, []store.Querier{tx})
 				if err != nil {
 					t.Fatal(err)
 				}
