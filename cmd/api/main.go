@@ -49,11 +49,17 @@ func runServe() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	db, err := store.Open(ctx, env.Must("DATABASE_URL"))
+	shards, err := store.OpenShards(ctx, env.ShardURLs())
 	if err != nil {
 		log.Fatalf("api: %v", err)
 	}
-	defer db.Close()
+	defer shards.Close()
+	// Temporary until cross-shard Accept and Capture land (PLAN P5.5–P5.6):
+	// ledger operations still run on shard 0 only.
+	if shards.N() > 1 {
+		log.Fatalf("%s: %d shards configured; multi-shard ledger operations arrive in P5.5–P5.6", "api", shards.N())
+	}
+	db := shards.Pool(0)
 	fp, err := failpoint.Parse(env.Or("FAILPOINTS", ""))
 	if err != nil {
 		log.Fatalf("api: FAILPOINTS: %v", err)
@@ -102,14 +108,16 @@ func runServe() {
 }
 
 func runMigrate() {
-	results, err := store.Migrate(context.Background(), env.Must("DATABASE_URL"))
-	if err != nil {
-		log.Fatalf("migrate: %v", err)
-	}
-	if len(results) == 0 {
-		log.Print("migrate: schema already current")
-	}
-	for _, r := range results {
-		log.Printf("migrate: applied %s in %s", r.Source.Path, r.Duration)
+	for i, url := range env.ShardURLs() {
+		results, err := store.Migrate(context.Background(), url)
+		if err != nil {
+			log.Fatalf("migrate: shard %d: %v", i, err)
+		}
+		if len(results) == 0 {
+			log.Printf("migrate: shard %d: schema already current", i)
+		}
+		for _, r := range results {
+			log.Printf("migrate: shard %d: applied %s in %s", i, r.Source.Path, r.Duration)
+		}
 	}
 }

@@ -25,11 +25,17 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	db, err := store.Open(ctx, env.Must("DATABASE_URL"))
+	shards, err := store.OpenShards(ctx, env.ShardURLs())
 	if err != nil {
 		log.Fatalf("worker: %v", err)
 	}
-	defer db.Close()
+	defer shards.Close()
+	// Temporary until cross-shard Accept and Capture land (PLAN P5.5–P5.6):
+	// ledger operations still run on shard 0 only.
+	if shards.N() > 1 {
+		log.Fatalf("%s: %d shards configured; multi-shard ledger operations arrive in P5.5–P5.6", "worker", shards.N())
+	}
+	db := shards.Pool(0)
 	fp, err := failpoint.Parse(env.Or("FAILPOINTS", ""))
 	if err != nil {
 		log.Fatalf("worker: FAILPOINTS: %v", err)

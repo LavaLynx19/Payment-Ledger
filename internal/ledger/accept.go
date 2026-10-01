@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"payment-ledger/internal/shard"
 	"payment-ledger/internal/store"
 )
 
@@ -120,7 +121,7 @@ func (l *Ledger) accept(ctx context.Context, typ, captureMode string, r AcceptRe
 	if ttl < 0 {
 		return store.Transfer{}, invalid("hold_ttl must be positive.")
 	}
-	id, err := uuid.NewV7()
+	id, err := shard.Like(r.SourceID) // the Transfer lives on its source's shard
 	if err != nil {
 		return store.Transfer{}, err
 	}

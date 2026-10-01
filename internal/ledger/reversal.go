@@ -7,6 +7,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"payment-ledger/internal/shard"
 	"payment-ledger/internal/store"
 )
 
@@ -21,10 +22,6 @@ func (e *NotReversibleError) Error() string { return e.Msg }
 // recipient owes, and the payer is made whole either way. Either returned
 // Transfer may be nil. Replaying the key returns the same Transfers.
 func (l *Ledger) ReverseTransfer(ctx context.Context, key string, hash []byte, transferID uuid.UUID) (reversal, receivable *store.Transfer, err error) {
-	keyID, err := uuid.NewV7()
-	if err != nil {
-		return nil, nil, err
-	}
 	var claimed bool
 	err = l.runCAS(ctx, "reverse", func(tx pgx.Tx) error {
 		reversal, receivable = nil, nil
@@ -32,6 +29,12 @@ func (l *Ledger) ReverseTransfer(ctx context.Context, key string, hash []byte, t
 		if errors.Is(err, store.ErrTransferNotFound) {
 			return &NotFoundError{Resource: "transfer", ID: transferID.String()}
 		}
+		if err != nil {
+			return err
+		}
+		// Both new Transfers start on the recipient's side (the recipient and
+		// its receivable share a shard), so the key's id is minted there.
+		keyID, err := shard.Like(orig.DestID)
 		if err != nil {
 			return err
 		}
@@ -104,7 +107,7 @@ func (l *Ledger) reverse(ctx context.Context, tx pgx.Tx, orig store.Transfer, ke
 	// exactly once.
 	nextID := func() uuid.UUID {
 		id := keyID
-		keyID = uuid.Must(uuid.NewV7())
+		keyID = uuid.Must(shard.Like(recipient))
 		return id
 	}
 	reverses := orig.ID

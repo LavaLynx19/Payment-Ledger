@@ -17,7 +17,7 @@ Go, connect-go over h2c, pgx v5 + pgxpool, goose, PostgreSQL via Docker Compose,
 - Placing a Hold bumps the source Account's version. A Reversal bumps the debtor Wallet's version.
 - Insert Entries after the CAS succeeds, with `created_at = clock_timestamp()` plus `balance_after` and `account_version`.
 - Available balance is always derived (posted − active unexpired Holds). A Hold with `expires_at IS NULL` never expires.
-- IDs are UUIDv7, generated in Go before insert.
+- IDs are UUIDv7, generated in Go before insert, always through `internal/shard` (`shard.NewID(s)` or `shard.Like(ref)`) so each id carries its shard (A§9.1). Use `Like` for anything that lives with another row: a Transfer or Hold with its source, an Entry with its Account, a receivable with its debtor.
 - Errors come from the A§7 table: Connect code + `reason` + human message. New reasons go into A§7 first.
 - Failpoints use the names in A§5 exactly. Each is a no-op unless its env var enables it.
 

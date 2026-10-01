@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -15,6 +16,21 @@ func Must(name string) string {
 		log.Fatalf("%s is not set", name)
 	}
 	return v
+}
+
+// ShardURLs reads the comma-separated SHARD_URLS (shard 0 first), falling
+// back to DATABASE_URL as a single shard. It exits if neither is set.
+func ShardURLs() []string {
+	var urls []string
+	for _, u := range strings.Split(os.Getenv("SHARD_URLS"), ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			urls = append(urls, u)
+		}
+	}
+	if len(urls) == 0 {
+		urls = []string{Must("DATABASE_URL")}
+	}
+	return urls
 }
 
 func Or(name, fallback string) string {

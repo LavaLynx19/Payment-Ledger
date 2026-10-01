@@ -1,6 +1,7 @@
-// Command seed creates the funding System account (if missing) and N empty
-// Wallets, then prints their IDs as JSON for the harness. Wallets start at
-// zero: money enters only through Top-ups, so every balance is backed by Entries.
+// Command seed creates each shard's funding System account (if missing) and
+// N empty Wallets spread round-robin across shards, then prints their IDs as
+// JSON for the harness. Wallets start at zero: money enters only through
+// Top-ups, so every balance is backed by Entries.
 package main
 
 import (
@@ -17,8 +18,9 @@ import (
 )
 
 type output struct {
-	FundingID uuid.UUID   `json:"funding_id"`
-	WalletIDs []uuid.UUID `json:"wallet_ids"`
+	FundingID  uuid.UUID   `json:"funding_id"`  // shard 0's, for single-shard scenarios
+	FundingIDs []uuid.UUID `json:"funding_ids"` // one per shard, in shard order
+	WalletIDs  []uuid.UUID `json:"wallet_ids"`
 }
 
 func main() {
@@ -26,17 +28,22 @@ func main() {
 	flag.Parse()
 
 	ctx := context.Background()
-	db, err := store.Open(ctx, env.Must("DATABASE_URL"))
+	shards, err := store.OpenShards(ctx, env.ShardURLs())
 	if err != nil {
 		log.Fatalf("seed: %v", err)
 	}
-	defer db.Close()
+	defer shards.Close()
 
 	var out output
-	if out.FundingID, err = store.EnsureFundingAccount(ctx, db); err != nil {
-		log.Fatalf("seed: %v", err)
+	for i := range shards.N() {
+		id, err := store.EnsureFundingAccountOn(ctx, shards.Pool(i), i)
+		if err != nil {
+			log.Fatalf("seed: shard %d: %v", i, err)
+		}
+		out.FundingIDs = append(out.FundingIDs, id)
 	}
-	if out.WalletIDs, err = store.CreateWallets(ctx, db, *wallets); err != nil {
+	out.FundingID = out.FundingIDs[0]
+	if out.WalletIDs, err = shards.CreateWallets(ctx, *wallets); err != nil {
 		log.Fatalf("seed: %v", err)
 	}
 	if err := json.NewEncoder(os.Stdout).Encode(out); err != nil {

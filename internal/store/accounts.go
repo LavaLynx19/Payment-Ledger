@@ -9,6 +9,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"payment-ledger/internal/shard"
 )
 
 // Open connects a pgx pool to dsn and verifies it with a ping.
@@ -24,9 +26,15 @@ func Open(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	return pool, nil
 }
 
-// EnsureFundingAccount returns the funding System account, creating it on
-// first use.
+// EnsureFundingAccount is EnsureFundingAccountOn for shard 0.
 func EnsureFundingAccount(ctx context.Context, db *pgxpool.Pool) (uuid.UUID, error) {
+	return EnsureFundingAccountOn(ctx, db, 0)
+}
+
+// EnsureFundingAccountOn returns the funding System account of the shard db
+// belongs to (index s), creating it on first use. Each shard has its own
+// funding account, so TopUps and Withdrawals stay single-shard (A§9.1).
+func EnsureFundingAccountOn(ctx context.Context, db *pgxpool.Pool, s int) (uuid.UUID, error) {
 	var id uuid.UUID
 	err := db.QueryRow(ctx, `SELECT id FROM accounts WHERE subtype = 'funding' LIMIT 1`).Scan(&id)
 	if err == nil {
@@ -35,7 +43,7 @@ func EnsureFundingAccount(ctx context.Context, db *pgxpool.Pool) (uuid.UUID, err
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return uuid.Nil, fmt.Errorf("find funding account: %w", err)
 	}
-	id, err = uuid.NewV7()
+	id, err = shard.NewID(s)
 	if err != nil {
 		return uuid.Nil, err
 	}
@@ -47,12 +55,18 @@ func EnsureFundingAccount(ctx context.Context, db *pgxpool.Pool) (uuid.UUID, err
 	return id, nil
 }
 
-// CreateWallets inserts n empty Wallets and returns their IDs.
+// CreateWallets is CreateWalletsOn for shard 0.
 func CreateWallets(ctx context.Context, db *pgxpool.Pool, n int) ([]uuid.UUID, error) {
+	return CreateWalletsOn(ctx, db, 0, n)
+}
+
+// CreateWalletsOn inserts n empty Wallets into db, the pool of shard s, each
+// minted with s's bits, and returns their IDs.
+func CreateWalletsOn(ctx context.Context, db *pgxpool.Pool, s, n int) ([]uuid.UUID, error) {
 	ids := make([]uuid.UUID, n)
 	rows := make([][]any, n)
 	for i := range ids {
-		id, err := uuid.NewV7()
+		id, err := shard.NewID(s)
 		if err != nil {
 			return nil, err
 		}
