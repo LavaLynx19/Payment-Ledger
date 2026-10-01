@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"expvar"
 	"testing"
 
 	"github.com/google/uuid"
@@ -26,7 +27,7 @@ func TestRetryOnConflict(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			calls := 0
-			err := retryOnConflict(ctx, 3, func() error {
+			err := retryOnConflict(ctx, 3, nil, "test", func() error {
 				err := c.results[calls]
 				calls++
 				return err
@@ -38,6 +39,26 @@ func TestRetryOnConflict(t *testing.T) {
 				t.Errorf("calls = %d, want %d", calls, c.wantCalls)
 			}
 		})
+	}
+}
+
+func TestRetryOnConflictCounts(t *testing.T) {
+	stats := new(expvar.Map).Init()
+	results := []error{ErrVersionConflict, nil, ErrVersionConflict, ErrVersionConflict}
+	calls := 0
+	try := func() error { err := results[calls]; calls++; return err }
+
+	_ = retryOnConflict(context.Background(), 2, stats, "accept", try) // conflict, then success
+	_ = retryOnConflict(context.Background(), 2, stats, "accept", try) // two conflicts, exhausted
+
+	for key, want := range map[string]int64{"accept.attempts": 4, "accept.conflicts": 3, "accept.exhausted": 1} {
+		got := int64(0)
+		if v, ok := stats.Get(key).(*expvar.Int); ok {
+			got = v.Value()
+		}
+		if got != want {
+			t.Errorf("%s = %d, want %d", key, got, want)
+		}
 	}
 }
 
