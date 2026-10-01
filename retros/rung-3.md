@@ -85,6 +85,13 @@ All runs were CLEAN with 0 capture conflicts, accept conflicts at 3–4% (payer-
 
 Stage 3 (sub-accounts) stays deferred: one batched row keeps up. Revisit if Rung 4's sharding concentrates a hot key further.
 
+## Regression: Rung 2 fault matrix with batched capture
+Stages 1-2 rewrote capture, which is where Rung 2's crash guarantees live, so the full matrix was rerun (`harness/faults/matrix.sh`, 2,000/s, 40s per run).
+
+- **All 11 runs PASS.** 27 failpoint crashes plus 6 kill -9s (api, worker, Postgres): 0 lost, 0 not posted, 0 keys mapped to a different Transfer, CLEAN everywhere. A crash mid-capture now rolls back a whole batch, and recovery re-claims it with the money posted once.
+- **Capture failpoints fired only once each** (4–7 in Rung 2). Batching cut capture txs to about a third, so fixed per-tx probabilities hit less often. Raise them about 3× for equal coverage next time.
+- **Crash-time p99 spiked on two api-side runs**: accept.after_commit 3.12 s (7 crashes in 40s), reversal.after_commit 1.07 s. Clustered crashes escalate Docker's restart backoff, and clients wait out the restart. These are api-side failpoints that capture doesn't touch, so batching isn't the cause. Crash-time p99 isn't gated (Decision Log → *Rung gates*), and every request converged.
+
 ## Lessons
 1. **A version check only belongs where it guards a read-dependent decision.** CAS everywhere turned a hot row into a retry storm (51% conflicts). Lock-based posting where funds were already reserved turned it into a short queue.
 2. **Async paths hide contention from client latency.** The hot-destination run's p99 looked healthy at first, while the worker fell 11s behind. Posted/s end to end and the CAS counters exposed it.
