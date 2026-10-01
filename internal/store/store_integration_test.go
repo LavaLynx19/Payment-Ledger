@@ -81,7 +81,7 @@ func TestRunCASConcurrentWritersLoseNothing(t *testing.T) {
 	for range writers {
 		wg.Go(func() {
 			for range perWriter {
-				errs <- RunCAS(ctx, db, 1000, func(tx pgx.Tx) error {
+				errs <- RunCAS(ctx, db, 1000, nil, "test", func(tx pgx.Tx) error {
 					a, err := GetAccount(ctx, tx, id)
 					if err != nil {
 						return err

@@ -10,7 +10,7 @@
 #   FAILPOINTS=capture.after_entries=0.0002 harness/run.sh 2
 #   KILL="api:6 worker:9 postgres:20" AGE_KEYS=1 harness/run.sh 2
 #
-# Env passed to k6 when set: VUS DURATION FUNDING RATE SENDERS MAX_AMOUNT MAX_VUS
+# Env passed to k6 when set: VUS DURATION FUNDING RATE SENDERS MAX_AMOUNT MAX_VUS HOT_DEST_SHARE TOPUP_SHARE
 # Faults: FAILPOINTS (passed to api/worker via Compose), KILL ("svc:every ..."),
 #         AGE_KEYS=1 (backdate settled keys so purge runs)
 set -euo pipefail
@@ -29,7 +29,7 @@ step() { printf '\n== %s\n' "$*"; }
 psql() { "${COMPOSE[@]}" exec -T postgres psql -U ledger -d ledger -tA "$@"; }
 
 k6_env=()
-for v in VUS DURATION FUNDING RATE SENDERS MAX_AMOUNT MAX_VUS; do
+for v in VUS DURATION FUNDING RATE SENDERS MAX_AMOUNT MAX_VUS HOT_DEST_SHARE TOPUP_SHARE; do
   [[ -n "${!v:-}" ]] && k6_env+=(-e "$v=${!v}")
 done
 
@@ -117,8 +117,14 @@ if [[ -s "$acks" ]]; then
 fi
 
 # Postgres stays up for inspection. The app stops, so its worker can't
-# capture Holds that integration tests create in the same database.
+# capture Holds that integration tests create in the same database. A
+# graceful stop makes each process log its final CAS totals.
 "${COMPOSE[@]}" stop api worker >/dev/null 2>&1
+
+step "CAS counters (attempts / conflicts / exhausted per op, last process lifetime)"
+for svc in api worker; do
+  echo "$svc: $("${COMPOSE[@]}" logs --no-log-prefix "$svc" 2>/dev/null | grep -o 'cas: {.*}' | tail -1)"
+done
 
 step "checker"
 set +e

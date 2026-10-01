@@ -166,19 +166,86 @@ func ActiveHolds(ctx context.Context, q Querier, accountID uuid.UUID) ([]Hold, e
 	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (Hold, error) { return scanHold(r) })
 }
 
-// ClaimCapturableHold locks the oldest active auto-capture Hold that no other
-// worker holds (FOR UPDATE SKIP LOCKED). It reports false when none is available.
-func ClaimCapturableHold(ctx context.Context, tx pgx.Tx) (Hold, bool, error) {
-	h, err := scanHold(tx.QueryRow(ctx,
+// ClaimCapturableHolds locks up to limit of the oldest active auto-capture
+// Holds that no other worker holds (FOR UPDATE SKIP LOCKED). It returns
+// whatever is available right now, possibly none.
+func ClaimCapturableHolds(ctx context.Context, tx pgx.Tx, limit int) ([]Hold, error) {
+	rows, err := tx.Query(ctx,
 		`SELECT `+holdCols+` FROM holds WHERE capture_mode = 'auto' AND `+activeHold+`
-		 ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED`))
-	if errors.Is(err, pgx.ErrNoRows) {
-		return Hold{}, false, nil
-	}
+		 ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED`, limit)
 	if err != nil {
-		return Hold{}, false, fmt.Errorf("claim hold: %w", err)
+		return nil, fmt.Errorf("claim holds: %w", err)
 	}
-	return h, true, nil
+	hs, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (Hold, error) { return scanHold(r) })
+	if err != nil {
+		return nil, fmt.Errorf("claim holds: %w", err)
+	}
+	return hs, nil
+}
+
+// MarkHoldsCaptured moves each still-active, unexpired Hold in ids to captured
+// for its full amount. It returns the ids it captured. Any missing id lost to
+// expiry (A§5 Capture step 2).
+func MarkHoldsCaptured(ctx context.Context, tx pgx.Tx, ids []uuid.UUID) (map[uuid.UUID]bool, error) {
+	rows, err := tx.Query(ctx,
+		`UPDATE holds SET status = 'captured', captured_amount = amount
+		 WHERE id = ANY($1) AND `+activeHold+` RETURNING id`, ids)
+	if err != nil {
+		return nil, fmt.Errorf("capture holds: %w", err)
+	}
+	won, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID])
+	if err != nil {
+		return nil, fmt.Errorf("capture holds: %w", err)
+	}
+	set := make(map[uuid.UUID]bool, len(won))
+	for _, id := range won {
+		set[id] = true
+	}
+	return set, nil
+}
+
+// SetTransfersStatus sets status on every Transfer in ids (see SetTransferStatus).
+func SetTransfersStatus(ctx context.Context, tx pgx.Tx, ids []uuid.UUID, status string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	_, err := tx.Exec(ctx,
+		`UPDATE transfers SET status = $2,
+		        posted_at = CASE WHEN $2 = 'posted' THEN clock_timestamp() ELSE posted_at END
+		 WHERE id = ANY($1)`, ids, status)
+	if err != nil {
+		return fmt.Errorf("set transfers status: %w", err)
+	}
+	return nil
+}
+
+// InsertEntries records es in order with one statement. Each row is stamped
+// with clock_timestamp() after the Account updates that produced its balance
+// and version.
+func InsertEntries(ctx context.Context, tx pgx.Tx, es []Entry) error {
+	n := len(es)
+	ids, transfers, accounts := make([]uuid.UUID, n), make([]uuid.UUID, n), make([]uuid.UUID, n)
+	dirs := make([]string, n)
+	amounts, balances, versions := make([]int64, n), make([]int64, n), make([]int64, n)
+	for i, e := range es {
+		id, err := uuid.NewV7()
+		if err != nil {
+			return err
+		}
+		ids[i], transfers[i], accounts[i] = id, e.TransferID, e.AccountID
+		dirs[i], amounts[i], balances[i], versions[i] = e.Direction, e.Amount, e.BalanceAfter, e.AccountVersion
+	}
+	_, err := tx.Exec(ctx,
+		`INSERT INTO entries (id, transfer_id, account_id, direction, amount, balance_after, account_version, created_at)
+		 SELECT id, transfer_id, account_id, direction, amount, balance_after, account_version, clock_timestamp()
+		 FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::text[], $5::bigint[], $6::bigint[], $7::bigint[])
+		      WITH ORDINALITY AS e(id, transfer_id, account_id, direction, amount, balance_after, account_version, ord)
+		 ORDER BY ord`,
+		ids, transfers, accounts, dirs, amounts, balances, versions)
+	if err != nil {
+		return fmt.Errorf("insert entries: %w", err)
+	}
+	return nil
 }
 
 // MarkHoldCaptured moves an active, unexpired Hold to captured. It reports
@@ -191,23 +258,6 @@ func MarkHoldCaptured(ctx context.Context, tx pgx.Tx, holdID uuid.UUID, amount i
 		return false, fmt.Errorf("capture hold: %w", err)
 	}
 	return tag.RowsAffected() == 1, nil
-}
-
-// InsertEntry records e, stamped with clock_timestamp() after the Account CAS
-// that produced its balance and version.
-func InsertEntry(ctx context.Context, tx pgx.Tx, e Entry) error {
-	id, err := uuid.NewV7()
-	if err != nil {
-		return err
-	}
-	_, err = tx.Exec(ctx,
-		`INSERT INTO entries (id, transfer_id, account_id, direction, amount, balance_after, account_version, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, clock_timestamp())`,
-		id, e.TransferID, e.AccountID, e.Direction, e.Amount, e.BalanceAfter, e.AccountVersion)
-	if err != nil {
-		return fmt.Errorf("insert entry: %w", err)
-	}
-	return nil
 }
 
 // SetTransferStatus sets status. Moving to 'posted' also stamps posted_at.

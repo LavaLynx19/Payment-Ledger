@@ -35,24 +35,39 @@ func WithTx(ctx context.Context, db *pgxpool.Pool, fn func(pgx.Tx) error) error 
 	return pgx.BeginTxFunc(ctx, db, pgx.TxOptions{IsoLevel: pgx.ReadCommitted}, fn)
 }
 
-// RunCAS runs fn in a fresh tx and retries it from scratch, with a fresh read,
-// whenever fn returns ErrVersionConflict. After `attempts` conflicts it returns
-// ErrRetriesExhausted.
-func RunCAS(ctx context.Context, db *pgxpool.Pool, attempts int, fn func(pgx.Tx) error) error {
-	return retryOnConflict(ctx, attempts, func() error { return WithTx(ctx, db, fn) })
+// Counter receives CAS outcome counts keyed "<op>.attempts", "<op>.conflicts"
+// and "<op>.exhausted". *expvar.Map satisfies it. Nil disables counting.
+type Counter interface {
+	Add(key string, delta int64)
 }
 
-func retryOnConflict(ctx context.Context, attempts int, try func() error) error {
+// RunCAS runs fn in a fresh tx and retries it from scratch, with a fresh read,
+// whenever fn returns ErrVersionConflict. After `attempts` conflicts it returns
+// ErrRetriesExhausted. op labels the counts in stats.
+func RunCAS(ctx context.Context, db *pgxpool.Pool, attempts int, stats Counter, op string, fn func(pgx.Tx) error) error {
+	return retryOnConflict(ctx, attempts, stats, op, func() error { return WithTx(ctx, db, fn) })
+}
+
+func retryOnConflict(ctx context.Context, attempts int, stats Counter, op string, try func() error) error {
 	for range attempts {
+		count(stats, op+".attempts")
 		err := try()
 		if !errors.Is(err, ErrVersionConflict) {
 			return err
 		}
+		count(stats, op+".conflicts")
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 	}
+	count(stats, op+".exhausted")
 	return ErrRetriesExhausted
+}
+
+func count(stats Counter, key string) {
+	if stats != nil {
+		stats.Add(key, 1)
+	}
 }
 
 // GetAccount reads the Account row that a later CASAccount call will guard.
@@ -86,6 +101,31 @@ func CASAccount(ctx context.Context, tx pgx.Tx, id uuid.UUID, expected, delta in
 		return 0, 0, fmt.Errorf("cas account: %w", err)
 	}
 	return posted, version, nil
+}
+
+// ApplyNet posts k legs to one Account in a single row update: debits and
+// credits are the leg totals per direction, the sign comes from the
+// Account's normal balance, and the version moves by k. It returns the new
+// posted balance and version plus the normal balance, so callers can rebuild
+// each leg's running balance. There's no version check: concurrent posters
+// queue on the row lock instead of conflicting. Use it only where no funds
+// check depends on the read (capture: funds were reserved at Accept).
+func ApplyNet(ctx context.Context, tx pgx.Tx, id uuid.UUID, debits, credits int64, k int) (posted, version int64, normal string, err error) {
+	err = tx.QueryRow(ctx,
+		`UPDATE accounts
+		 SET posted = posted + CASE WHEN normal_balance = 'debit' THEN $2::bigint - $3::bigint
+		                            ELSE $3::bigint - $2::bigint END,
+		     version = version + $4
+		 WHERE id = $1
+		 RETURNING posted, version, normal_balance`, id, debits, credits, k,
+	).Scan(&posted, &version, &normal)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, 0, "", ErrAccountNotFound
+	}
+	if err != nil {
+		return 0, 0, "", fmt.Errorf("apply net posting: %w", err)
+	}
+	return posted, version, normal, nil
 }
 
 // Ascending returns ids in the order a multi-Account tx must update them, so

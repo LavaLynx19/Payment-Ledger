@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"expvar"
 	"fmt"
 	"log"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"payment-ledger/internal/env"
 	"payment-ledger/internal/failpoint"
 	"payment-ledger/internal/ledger"
+	"payment-ledger/internal/metrics"
 	"payment-ledger/internal/store"
 )
 
@@ -57,14 +59,23 @@ func runServe() {
 		log.Fatalf("api: FAILPOINTS: %v", err)
 	}
 	log.Printf("api: failpoints: %s", fp)
+	cas := expvar.NewMap("cas")
 	l, err := ledger.New(ctx, db, ledger.Config{
 		HoldTTL:     env.Duration("HOLD_TTL", 30*time.Second),
 		CASAttempts: env.Int("CAS_ATTEMPTS", 10),
 		Failpoints:  fp,
+		CASStats:    cas,
 	})
 	if err != nil {
 		log.Fatalf("api: %v", err)
 	}
+	logged := make(chan struct{})
+	go func() { defer close(logged); metrics.LogEvery(ctx, "cas", cas, 10*time.Second) }()
+	defer func() { <-logged }() // final totals are logged before exit
+
+	mux := http.NewServeMux()
+	mux.Handle("/", api.NewHandler(api.NewService(l), tokens))
+	mux.Handle("/debug/vars", expvar.Handler())
 
 	// HTTP/1.1 for Connect JSON clients, plaintext HTTP/2 (h2c) for gRPC clients like k6.
 	protocols := new(http.Protocols)
@@ -73,7 +84,7 @@ func runServe() {
 
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           api.NewHandler(api.NewService(l), tokens),
+		Handler:           mux,
 		Protocols:         protocols,
 		ReadHeaderTimeout: 5 * time.Second,
 	}

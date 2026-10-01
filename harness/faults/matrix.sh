@@ -16,7 +16,8 @@ export WALLETS="${WALLETS:-100}" DURATION="${DURATION:-40s}" AGE_KEYS=1
 # Hits per second at RATE=2000 (80% P2P, 10% Holds, 10% reversals).
 prob() {
   case "$1" in
-    accept.* | capture.*) echo 0.00005 ;;
+    accept.*) echo 0.00005 ;;
+    capture.*) echo 0.00015 ;; # batched capture: ~1/3 the txs (Rung 3)
     release.*) echo 0.001 ;;
     reversal.*) echo 0.0004 ;;
     sweeper.*) echo 0.08 ;;

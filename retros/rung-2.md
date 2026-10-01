@@ -58,6 +58,14 @@ The gates were clarified (README, and Decision Log → *Rung gates: total ops/s,
 
 The fault-free p99 swung 2× between identical runs, and the rerun came after about 25 minutes of sustained load on the laptop. Likely causes are thermal and VM noise plus the heavier mix (Holds, reversals, and 5 capture paths competing on Accounts). It's not code: the failpoint hook is a nil check when disabled. Re-measuring on a cool machine is the first item of Rung 3 (PLAN P4.0), which is about latency under contention anyway.
 
+## Addendum: P4.0 re-measure on a cool machine
+| Run | Throughput | p99 |
+|---|---|---|
+| Rung 1 baseline, 2,000/s | 2,000 posted/s | **6.27 ms** (within the gate) |
+| Rung 2 fault-free mix, 2,000/s | 1,981 ops/s | **9.84 ms** (over the 7.6 ms gate) |
+
+Heat only explained part of the 16.6 ms reading. On a cool machine, the Rung 2 mix is still over the gate. The new CAS counters show why: even with traffic spread evenly over 100 Wallets, 6–7% of CAS txs conflict (accept 6.0%, capture 6.9%, reverse 7.2%), and each conflict is a full retry. The miss stays accepted here and is carried into Rung 3 as its starting measurement.
+
 ## Lessons
 1. **Crash safety came from structure, not recovery code.** No crash-specific recovery logic was written. One tx per path, the key in the same tx, and SKIP LOCKED re-claim were enough.
 2. **Only a definite answer should end a retry.** Retrying unknown outcomes with the same key is what turns "maybe" into "exactly once".

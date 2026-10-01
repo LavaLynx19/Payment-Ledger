@@ -9,61 +9,135 @@ import (
 	"payment-ledger/internal/store"
 )
 
-// CaptureNext captures one active Hold in full and posts its Transfer (A§5
-// Capture). It reports false when no Hold is waiting.
+// CaptureNext captures one active Hold in full and posts its Transfer. It
+// reports false when no Hold is waiting.
 func (l *Ledger) CaptureNext(ctx context.Context) (bool, error) {
-	var found bool
-	err := store.RunCAS(ctx, l.db, l.cfg.CASAttempts, func(tx pgx.Tx) error {
-		h, ok, err := store.ClaimCapturableHold(ctx, tx)
-		found = ok
-		if err != nil || !ok {
+	n, err := l.CaptureBatch(ctx, 1)
+	return n > 0, err
+}
+
+// CaptureBatch captures up to max of the oldest active Holds in one tx (A§5
+// Capture, batched). It takes whatever is capturable now without waiting, so
+// at low load it's a batch of one. It returns how many Holds it claimed,
+// including any that lost to expiry and failed.
+func (l *Ledger) CaptureBatch(ctx context.Context, max int) (int, error) {
+	var claimed int
+	err := l.runCAS(ctx, "capture", func(tx pgx.Tx) error {
+		holds, err := store.ClaimCapturableHolds(ctx, tx, max)
+		claimed = len(holds)
+		if err != nil || claimed == 0 {
 			return err
 		}
 		l.fail("capture.after_claim")
-		captured, err := store.MarkHoldCaptured(ctx, tx, h.ID, h.Amount)
+
+		ids := make([]uuid.UUID, len(holds))
+		for i, h := range holds {
+			ids[i] = h.ID
+		}
+		won, err := store.MarkHoldsCaptured(ctx, tx, ids)
 		if err != nil {
 			return err
 		}
-		if !captured { // expiry committed first
-			return store.SetTransferStatus(ctx, tx, h.TransferID, "failed")
+		var posted, failed []uuid.UUID
+		var legs []leg
+		for _, h := range holds {
+			if !won[h.ID] { // expiry committed first
+				failed = append(failed, h.TransferID)
+				continue
+			}
+			posted = append(posted, h.TransferID)
+			legs = append(legs, transferLegs(h.TransferID, h.SourceID, h.DestID, h.Amount)...)
 		}
-		if err := post(ctx, tx, h.TransferID, h.SourceID, h.DestID, h.Amount); err != nil {
+		if err := postLegs(ctx, tx, legs); err != nil {
 			return err
 		}
 		l.fail("capture.after_entries")
-		return store.SetTransferStatus(ctx, tx, h.TransferID, "posted")
+		if err := store.SetTransfersStatus(ctx, tx, failed, "failed"); err != nil {
+			return err
+		}
+		return store.SetTransfersStatus(ctx, tx, posted, "posted")
 	})
-	if err == nil && found {
+	if err == nil && claimed > 0 {
 		l.fail("capture.after_commit")
 	}
-	return found, err
+	return claimed, err
 }
 
-// post debits the source and credits the destination. Accounts are updated in
-// ascending id order, and each Entry records the balance and version its CAS
-// produced.
+// leg is one side of a posting: a debit of the source or a credit of the
+// destination.
+type leg struct {
+	transferID uuid.UUID
+	accountID  uuid.UUID
+	direction  string
+	amount     int64
+}
+
+func transferLegs(transferID, sourceID, destID uuid.UUID, amount int64) []leg {
+	return []leg{
+		{transferID, sourceID, "debit", amount},
+		{transferID, destID, "credit", amount},
+	}
+}
+
+// post debits the source and credits the destination of one Transfer.
 func post(ctx context.Context, tx pgx.Tx, transferID, sourceID, destID uuid.UUID, amount int64) error {
-	direction := map[uuid.UUID]string{sourceID: "debit", destID: "credit"}
-	for _, id := range store.Ascending(sourceID, destID) {
-		a, err := store.GetAccount(ctx, tx, id)
+	return postLegs(ctx, tx, transferLegs(transferID, sourceID, destID, amount))
+}
+
+// postLegs applies legs with one netted row update per Account, in ascending
+// id order so concurrent batches can't deadlock. Each Account's legs get
+// consecutive versions and a running balance_after, rebuilt from the update's
+// returned totals. There's no CAS: debits were reserved at Accept, so
+// concurrent captures queue on a hot row instead of retrying (Decision Log →
+// "Rung 3: version checks only where a funds check needs them").
+func postLegs(ctx context.Context, tx pgx.Tx, legs []leg) error {
+	if len(legs) == 0 {
+		return nil
+	}
+	byAccount := map[uuid.UUID][]leg{}
+	for _, lg := range legs {
+		byAccount[lg.accountID] = append(byAccount[lg.accountID], lg)
+	}
+	accounts := make([]uuid.UUID, 0, len(byAccount))
+	for id := range byAccount {
+		accounts = append(accounts, id)
+	}
+
+	entries := make([]store.Entry, 0, len(legs))
+	for _, id := range store.Ascending(accounts...) {
+		ls := byAccount[id]
+		var debits, credits int64
+		for _, lg := range ls {
+			if lg.direction == "debit" {
+				debits += lg.amount
+			} else {
+				credits += lg.amount
+			}
+		}
+		posted, version, normal, err := store.ApplyNet(ctx, tx, id, debits, credits, len(ls))
 		if err != nil {
 			return err
 		}
-		dir := direction[id]
-		delta := amount
-		if dir != a.NormalBalance {
-			delta = -amount
+		// Walk forward from the balance and version before this update.
+		signed := func(lg leg) int64 {
+			if lg.direction == normal {
+				return lg.amount
+			}
+			return -lg.amount
 		}
-		posted, version, err := store.CASAccount(ctx, tx, id, a.Version, delta)
-		if err != nil {
-			return err
+		balance := posted
+		for _, lg := range ls {
+			balance -= signed(lg)
 		}
-		if err := store.InsertEntry(ctx, tx, store.Entry{
-			TransferID: transferID, AccountID: id, Direction: dir,
-			Amount: amount, BalanceAfter: posted, AccountVersion: version,
-		}); err != nil {
-			return err
+		v := version - int64(len(ls))
+		for _, lg := range ls {
+			balance += signed(lg)
+			v++
+			entries = append(entries, store.Entry{
+				TransferID: lg.transferID, AccountID: id, Direction: lg.direction,
+				Amount: lg.amount, BalanceAfter: balance, AccountVersion: v,
+			})
 		}
 	}
-	return nil
+	return store.InsertEntries(ctx, tx, entries)
 }

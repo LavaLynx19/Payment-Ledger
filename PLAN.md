@@ -42,10 +42,13 @@ This plan covers task order, verification, and commit sequence. Requirements are
 - [x] P3.5 Run to target; fix findings; `retros/rung-2.md` → §P3
 
 ### Phase 4 — Rung 3: hot Account contention (§P4)
-- [ ] P4.0 Re-measure Rung 2 fault-free p99 and the Rung 1 baseline on a cool machine (Rung 2 p99 miss accepted with a note) → §P4
-- [ ] P4.1 `harness/k6/rung3.js`: skewed traffic on funding account + popular destination; record retries + p99 → §P4
-- [>] P4.2 Hot-Account strategy (design + Decision Log entry) → defer until: P4.1 measurements exist
-- [>] P4.3 Implement strategy, rerun to target, `retros/rung-3.md` → defer until: P4.2 approved
+- [x] P4.0 Re-measure Rung 2 fault-free p99 and the Rung 1 baseline on a cool machine (Rung 2 p99 miss accepted with a note) → §P4
+- [x] P4.1 `harness/k6/rung3.js`: skewed traffic on funding account + popular destination; record retries + p99 → §P4
+- [x] P4.2 Hot-Account strategy (design + Decision Log entry) → §P4
+- [x] P4.3 Stage 1: lock-based capture + no accept CAS on System sources; re-measure the 3 hot runs → §P4
+- [x] P4.4 Stage 2: batch captures per hot Account (version bump by n); diagnosis showed row-lock (38%) + WAL (20%) waits → §P4
+- [>] P4.5 Stage 3: sub-accounts for hot keys (decide which Accounts may split) → defer until: Rung 4 design shows sharding concentrates a hot key beyond one batched row (stage 2 met the Rung 3 target)
+- [x] P4.6 `retros/rung-3.md` verdict → §P4
 
 ### Phase 5 — Rung 4: sharding + cross-shard (§P5)
 - [>] P5.1 Shard key + cross-shard protocol + strict-reads vs never-negative decision (ARCH update) → defer until: Rung 3 passes

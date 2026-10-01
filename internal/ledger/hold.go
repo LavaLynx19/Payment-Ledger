@@ -43,7 +43,7 @@ func (l *Ledger) PlaceHold(ctx context.Context, r AcceptRequest) (store.Transfer
 func (l *Ledger) CaptureHold(ctx context.Context, key string, hash []byte, holdID uuid.UUID, amount *int64) (store.Transfer, store.Hold, error) {
 	var t store.Transfer
 	var h store.Hold
-	err := store.RunCAS(ctx, l.db, l.cfg.CASAttempts, func(tx pgx.Tx) error {
+	err := l.runCAS(ctx, "capture_hold", func(tx pgx.Tx) error {
 		var err error
 		if h, err = l.lockManualHold(ctx, tx, holdID); err != nil {
 			return err
@@ -95,7 +95,7 @@ func (l *Ledger) capture(ctx context.Context, tx pgx.Tx, h store.Hold, amount *i
 // the current Hold.
 func (l *Ledger) ReleaseHold(ctx context.Context, key string, hash []byte, holdID uuid.UUID) (store.Hold, error) {
 	var h store.Hold
-	err := store.RunCAS(ctx, l.db, l.cfg.CASAttempts, func(tx pgx.Tx) error {
+	err := l.runCAS(ctx, "release", func(tx pgx.Tx) error {
 		var err error
 		if h, err = l.lockManualHold(ctx, tx, holdID); err != nil {
 			return err
