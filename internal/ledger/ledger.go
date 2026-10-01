@@ -12,8 +12,12 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"payment-ledger/internal/failpoint"
 	"payment-ledger/internal/store"
 )
+
+// fail fires the named A§5 crash point if it's enabled.
+func (l *Ledger) fail(name string) { l.cfg.Failpoints.Inject(name) }
 
 // Transfer types, matching transfers.type.
 const (
@@ -26,9 +30,10 @@ const (
 )
 
 type Config struct {
-	HoldTTL      time.Duration // default expiry for client-initiated Holds
-	CASAttempts  int           // tx attempts before CONFLICT_RETRIES_EXHAUSTED
-	KeyRetention time.Duration // how long idempotency keys are kept (A§2.7: 24h)
+	HoldTTL      time.Duration  // default expiry for client-initiated Holds
+	CASAttempts  int            // tx attempts before CONFLICT_RETRIES_EXHAUSTED
+	KeyRetention time.Duration  // how long idempotency keys are kept (A§2.7: 24h)
+	Failpoints   *failpoint.Set // Rung 2 crash points; nil disables all
 }
 
 type Ledger struct {

@@ -45,24 +45,29 @@ services:
     command: ["--once"]
     profiles: ["tools"]
 
+  # restart: on-failure brings api/worker back after a failpoint exit (Rung 2).
   api:
     <<: *app
     command: ["api", "serve"]
+    restart: on-failure
     environment:
       <<: *app-env
       LEDGER_SERVICE_TOKENS: ${LEDGER_SERVICE_TOKENS:-dev-token}
       HOLD_TTL: ${HOLD_TTL:-30s}
       CAS_ATTEMPTS: ${CAS_ATTEMPTS:-10}
+      FAILPOINTS: ${FAILPOINTS:-}
     ports:
       - "18080:8080"
 
   worker:
     <<: *app
     command: ["worker"]
+    restart: on-failure
     environment:
       <<: *app-env
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
       CAS_ATTEMPTS: ${CAS_ATTEMPTS:-10}
+      FAILPOINTS: ${FAILPOINTS:-}
 
   k6:
     image: grafana/k6:2.3.0

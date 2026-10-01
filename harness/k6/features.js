@@ -6,7 +6,7 @@
 // come back clean.
 import grpc from 'k6/net/grpc';
 import { Counter } from 'k6/metrics';
-import { callRetrying, connect, fund, pick, wallets } from './lib.js';
+import { code, callRetrying, connect, fund, pick, wallets } from './lib.js';
 
 const FUNDING = Number(__ENV.FUNDING || 10000);
 
@@ -41,9 +41,9 @@ const EXPECTED = {
 
 function op(method, body) {
   const res = callRetrying(method, body);
-  if (res.status === grpc.StatusOK) {
+  if (code(res.status) === code(grpc.StatusOK)) {
     ok.add(1, { op: method });
-  } else if (EXPECTED[method].includes(res.status)) {
+  } else if (EXPECTED[method].map(code).includes(code(res.status))) {
     rejected.add(1, { op: method });
   } else {
     failed.add(1, { op: method });
@@ -74,15 +74,15 @@ export default function () {
 
   if (roll < 0.35) {
     const res = op('CreateTransfer', { source_id: src, dest_id: dst, amount: amount(200) });
-    if (res.status === grpc.StatusOK) mine.push({ id: res.message.transfer.id, at: Date.now() });
+    if (code(res.status) === code(grpc.StatusOK)) mine.push({ id: res.message.transfer.id, at: Date.now() });
   } else if (roll < 0.55) {
     const res = op('PlaceHold', { source_id: src, dest_id: dst, amount: amount(200) });
-    if (res.status !== grpc.StatusOK) return;
+    if (code(res.status) !== code(grpc.StatusOK)) return;
     const holdId = res.message.hold.id;
     if (Math.random() < 0.7) {
       const capture = Math.random() < 0.5 ? undefined : amount(Number(res.message.hold.amount));
       const cap = op('CaptureHold', capture === undefined ? { hold_id: holdId } : { hold_id: holdId, amount: capture });
-      if (cap.status === grpc.StatusOK) mine.push({ id: res.message.transfer.id, at: Date.now() });
+      if (code(cap.status) === code(grpc.StatusOK)) mine.push({ id: res.message.transfer.id, at: Date.now() });
     } else {
       op('ReleaseHold', { hold_id: holdId });
     }

@@ -25,6 +25,7 @@ func (l *Ledger) ReverseTransfer(ctx context.Context, key string, hash []byte, t
 	if err != nil {
 		return nil, nil, err
 	}
+	var claimed bool
 	err = store.RunCAS(ctx, l.db, l.cfg.CASAttempts, func(tx pgx.Tx) error {
 		reversal, receivable = nil, nil
 		orig, err := store.LockTransfer(ctx, tx, transferID)
@@ -34,7 +35,7 @@ func (l *Ledger) ReverseTransfer(ctx context.Context, key string, hash []byte, t
 		if err != nil {
 			return err
 		}
-		_, claimed, err := store.ClaimIdempotencyKey(ctx, tx, key, hash, keyID)
+		_, claimed, err = store.ClaimIdempotencyKey(ctx, tx, key, hash, keyID)
 		if err != nil {
 			return err
 		}
@@ -42,9 +43,15 @@ func (l *Ledger) ReverseTransfer(ctx context.Context, key string, hash []byte, t
 			reversal, receivable, err = store.ReversalsOf(ctx, tx, orig.ID)
 			return err
 		}
-		reversal, receivable, err = l.reverse(ctx, tx, orig, keyID)
-		return err
+		if reversal, receivable, err = l.reverse(ctx, tx, orig, keyID); err != nil {
+			return err
+		}
+		l.fail("reversal.before_commit")
+		return nil
 	})
+	if err == nil && claimed {
+		l.fail("reversal.after_commit")
+	}
 	return reversal, receivable, err
 }
 

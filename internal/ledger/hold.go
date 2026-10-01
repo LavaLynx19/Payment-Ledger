@@ -125,6 +125,7 @@ func (l *Ledger) ReleaseHold(ctx context.Context, key string, hash []byte, holdI
 			return err
 		}
 		h.Status = "released"
+		l.fail("release.before_commit")
 		return nil
 	})
 	return h, err

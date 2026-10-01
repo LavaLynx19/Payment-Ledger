@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"payment-ledger/internal/env"
+	"payment-ledger/internal/failpoint"
 	"payment-ledger/internal/ledger"
 	"payment-ledger/internal/store"
 )
@@ -27,9 +28,15 @@ func main() {
 		log.Fatalf("worker: %v", err)
 	}
 	defer db.Close()
+	fp, err := failpoint.Parse(env.Or("FAILPOINTS", ""))
+	if err != nil {
+		log.Fatalf("worker: FAILPOINTS: %v", err)
+	}
+	log.Printf("worker: failpoints: %s", fp)
 	l, err := ledger.New(ctx, db, ledger.Config{
 		CASAttempts:  env.Int("CAS_ATTEMPTS", 10),
 		KeyRetention: env.Duration("IDEMPOTENCY_RETENTION", 24*time.Hour),
+		Failpoints:   fp,
 	})
 	if err != nil {
 		log.Fatalf("worker: %v", err)

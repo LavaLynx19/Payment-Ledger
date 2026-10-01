@@ -6,7 +6,7 @@
 import grpc from 'k6/net/grpc';
 import { Counter } from 'k6/metrics';
 import exec from 'k6/execution';
-import { call, connect, fund, pick, wallets } from './lib.js';
+import { code, call, connect, fund, pick, wallets } from './lib.js';
 
 const FUNDING = Number(__ENV.FUNDING || 1000);
 const MAX_AMOUNT = Number(__ENV.MAX_AMOUNT || 250);
@@ -41,9 +41,9 @@ export default function () {
   if (exec.vu.iterationInScenario === 0) connect();
   const amount = 1 + Math.floor(Math.random() * MAX_AMOUNT);
   const res = call('CreateTransfer', { source_id: pick(senders), dest_id: pick(receivers), amount });
-  if (res.status === grpc.StatusOK) {
+  if (code(res.status) === code(grpc.StatusOK)) {
     accepted.add(1);
-  } else if (res.status === grpc.StatusFailedPrecondition) {
+  } else if (code(res.status) === code(grpc.StatusFailedPrecondition)) {
     rejected.add(1);
   } else {
     failed.add(1);
