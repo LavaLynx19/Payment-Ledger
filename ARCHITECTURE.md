@@ -234,7 +234,7 @@ All paths run inside a single transaction under READ COMMITTED. A "CAS" is `UPDA
 1. `INSERT INTO idempotency_keys … ON CONFLICT DO NOTHING`. On conflict: if the hash matches, return the existing Transfer (PENDING or final); otherwise return `IDEMPOTENCY_MISMATCH`. If the original request is still in flight, the unique index makes this insert wait for the original to commit, and then it returns the same transfer ID.
 2. Read the source Account (`posted`, `version`) and its active, unexpired Holds.
 3. Wallet source only: reject with `RECEIVABLE_OPEN` if the Wallet's receivable is open and the type isn't `repayment`. Reject with `INSUFFICIENT_FUNDS` if Available < amount.
-4. CAS the source Account (version bump only, no balance change).
+4. Wallet source only: CAS the source Account (version bump only, no balance change). A System-account source (funding, receivable) is not CASed, because there's no funds check for the bump to protect (Decision Log → *Rung 3: version checks only where a funds check needs them*).
 5. Insert `transfers` (pending) and `holds` (active, `expires_at` = now + TTL). Commit, then respond PENDING.
 
 - `failpoint accept.before_commit`: the tx aborts and nothing persists. The client retries and is accepted as new.
@@ -243,8 +243,10 @@ All paths run inside a single transaction under READ COMMITTED. A "CAS" is `UPDA
 **Capture (worker)**
 1. Claim: `SELECT … FROM holds WHERE status='active' AND capture_mode='auto' AND (expires_at IS NULL OR expires_at > clock_timestamp()) … FOR UPDATE SKIP LOCKED LIMIT n`. Manual Holds (PlaceHold) are never claimed.
 2. `UPDATE holds SET status='captured' WHERE id=$1 AND status='active' AND (expires_at IS NULL OR expires_at > clock_timestamp())`. If this affects 0 rows, expiry won the race, so the Transfer is marked failed. First commit wins.
-3. CAS the source and destination in `id` order, debiting the source and crediting the destination. Each moves `posted` according to that Account's normal balance. Then insert the debit and credit Entries with `balance_after`, `account_version` = new version, and `created_at = clock_timestamp()`.
+3. Post to the source and destination in `id` order with one atomic `UPDATE accounts SET posted = posted ± amount, version = version + 1 WHERE id = $1 RETURNING posted, version` each. The sign comes from the Account's normal balance, and there is **no version check**: the debit was reserved by the Hold at Accept, and a credit can't break never-negative. Concurrent captures on a hot Account queue on its row lock instead of conflicting and retrying. Then insert the debit and credit Entries with `balance_after`, `account_version` = new version, and `created_at = clock_timestamp()`.
 4. Set the Transfer to `posted`. Commit.
+
+**Batched capture (Rung 3 stage 2).** The worker runs steps 1-4 for up to `WORKER_BATCH` (default 100) of the oldest capturable Holds in **one tx**. It takes whatever is capturable right now with no waiting, so at low load a batch is a single Hold. Holds whose expiry won step 2 fail individually inside the batch. Postings are netted per Account: each Account row is updated once (`posted ± net, version = version + k` for its k legs, in ascending `id` order). Each of its Entries gets a consecutive `account_version` and a running `balance_after` derived from the returned totals, so invariants 2 and 4 and point-in-time reads are unchanged. A hot Account takes one row-lock hold and the batch makes one commit for many captures, which cuts both waits P4.3's diagnosis found (row lock 38%, WAL flush 20%).
 
 **CaptureHold** (manual Holds only; runs synchronously in the API request)
 1. Lock the Hold (`SELECT … FOR UPDATE`), which serializes it against Release and other Captures. Then claim the Idempotency-Key against the Hold's Transfer. A replay returns the current Transfer and Hold.
@@ -292,6 +294,8 @@ Steps 2-5 of Accept without the CAS in step 4. Two concurrent Accepts both pass 
 ```
 
 All boxes are Compose services on one machine. The worker processes run Capture and the sweeper as separate loops. The harness script runs: bring up the stack → migrate → seed Accounts → k6 scenario → fault injection → checker → report.
+
+**CAS counters.** Every CAS tx counts `<op>.attempts`, `<op>.conflicts` and `<op>.exhausted` (ops: `accept`, `capture`, `capture_hold`, `release`, `reverse`) in a stdlib `expvar` map named `cas`, with no new dependency. The api serves it at `/debug/vars`. Both processes log it every 10s and at shutdown, and `run.sh` prints the final totals. The map is created in `main`, and the ledger only sees a `store.Counter` interface, so the library keeps no global state.
 
 **Rung 4 (deferred):** N Postgres shards keyed by Account and/or a TigerBeetle cluster. The cross-shard protocol and the strict-reads vs never-negative tradeoff are decided at that Rung and appended to the Decision Log.
 
@@ -370,6 +374,9 @@ Entries are inserted only after the Account CAS succeeds, and they're stamped wi
 
 ### Rung gates: total ops/s, and p99 only without faults
 Rung 2's scenario mixes P2P with Holds and reversals, and it deliberately crashes processes. A literal "2,000 posted/s at p99 ≤ 7.6 ms" would have failed for definitional reasons: P2P is only 80% of the mix, and a crash always delays in-flight calls, pushing p99 to 22–49 ms on api crashes and about 1 s when Postgres restarts. So throughput is total ops/s at the target rate, the p99 gate applies to the fault-free run, and crash-time p99 is recorded as observed.
+
+### Rung 3: version checks only where a funds check needs them
+P4.1 showed optimistic CAS everywhere turning hot Accounts into retry storms. With 80% of P2P going to one merchant, 51% of capture attempts conflicted (2,979 exhausted) and posted/s fell to 1,403. With 20% TopUps, 40% of accepts conflicted on the funding row and p99 hit 17 ms. A version check only earns its cost where it guards a funds check, which is Accept on a Wallet source. So capture posts with an atomic `posted ± x` under the row lock, and Accept no longer bumps System-account sources. The plan is staged by measurement: (1) these two changes; (2) batch captures per hot Account, bumping the version by n so each Entry keeps a consecutive version and its own `balance_after`, only if stage 1 misses the target; (3) sub-accounts for hot keys only if a batched single row still can't keep up, deciding then which Accounts may be split.
 
 ### System-initiated Holds never expire
 Every other Hold expires, but Reversal and receivable Holds have no expiry. If the worker is down or slow, a correction must not silently fail and leave a mistaken Transfer uncorrected. The cost is that the debtor's funds stay held until the worker recovers.
