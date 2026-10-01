@@ -51,10 +51,18 @@ This plan covers task order, verification, and commit sequence. Requirements are
 - [x] P4.6 `retros/rung-3.md` verdict → §P4
 
 ### Phase 5 — Rung 4: sharding + cross-shard (§P5)
-- [>] P5.1 Shard key + cross-shard protocol + strict-reads vs never-negative decision (ARCH update) → defer until: Rung 3 passes
-- [>] P5.2 Multi-Postgres Compose + toxiproxy → defer until: P5.1 approved
-- [>] P5.3 TigerBeetle comparison implementation → defer until: P5.1 approved
-- [>] P5.4 Run both, compare, `retros/rung-4.md` → defer until: P5.2 + P5.3 done
+- [x] P5.1 Shard key + cross-shard protocol + strict-reads vs never-negative decision (ARCH update, A§9) → §P5
+- [ ] P5.2 Compose: 2 Postgres shards (`max_prepared_transactions`), TigerBeetle (named volume, seccomp), toxiproxy — ask-first → §P5
+- [ ] P5.3 Shard routing: UUIDv7 shard bits, one pool per shard, migrate all shards, seed per-shard funding + round-robin Wallets → §P5
+- [ ] P5.4 Routed reads + ListReceivables fan-out → §P5
+- [ ] P5.5 2PC Accept: key on `hash(key)` shard, `decisions` table migration → §P5
+- [ ] P5.6 2PC Capture: batches grouped by destination shard → §P5
+- [ ] P5.7 Resolver (presumed abort) + `twopc.*` failpoints + counters → §P5
+- [ ] P5.8 Checker: per-shard invariants 2-7, global invariant 1, no prepared tx left → §P5
+- [ ] P5.9 Saga variant (`CROSS_SHARD=saga`): outbox, relay, Entry `(transfer_id, direction)` unique, saga-aware checker → §P5
+- [ ] P5.10 TigerBeetle engine core (`LEDGER_ENGINE=tigerbeetle`): Accounts, Transfers, Holds, reads; Linux-container tests → §P5
+- [ ] P5.11 TigerBeetle Receivable rules: debit-block chain, reversal shortfall chain, repay (from `prototypes/tb-gaps`) → §P5
+- [ ] P5.12 Measure 2PC vs saga vs TigerBeetle (baseline, hot runs, fault matrix incl. toxiproxy), `retros/rung-4.md` → §P5
 
 ### Phase 6 — Writeup (§P6)
 - [>] P6.1 Interview writeup via `/docs` (design, rung results, Decision Log walkthrough) → defer until: Rung 4 passes
@@ -117,7 +125,12 @@ Covers every remaining A§7 RPC and A§5 path.
 **Verify:** meet the target at the skewed load with a clean checker. The chosen strategy is recorded in the Decision Log.
 
 ## §P5 — Rung 4
-**Verify:** meet the target on the sharded setup for both implementations. The checker is clean across shards, including under toxiproxy partitions. The comparison goes in the retro.
+Design: A§9. Order: infrastructure (P5.2) → sharded Postgres (P5.3–P5.8) → saga variant (P5.9) → TigerBeetle (P5.10–P5.11) → measurement (P5.12). Each step keeps the single-shard test suite green; with N=1 the sharded code must behave exactly as before.
+**Verify:**
+- P5.3–P5.8: integration tests against two shards cover routing, cross-shard Accept and Capture, and each `twopc.*` crash point (prepared txs resolved by the resolver, money posted exactly once). The checker is clean across shards.
+- P5.9: the saga converges to the same balances as 2PC after the relay drains; its checker accounts for in-flight outbox rows.
+- P5.10–P5.11: the TigerBeetle engine passes the ledger behavior tests (run in a Linux container) and the two chains reproduce the prototype's results.
+- P5.12: Rung targets (README) on sharded Postgres; 2PC vs saga vs TigerBeetle reported as ratios; fault matrix plus toxiproxy partitions leave every checker clean; findings in `retros/rung-4.md`.
 
 ## §P6 — Writeup
 **Verify:** each Decision Log entry is walked through with the evidence from its rung.
