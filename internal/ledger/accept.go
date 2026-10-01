@@ -31,19 +31,19 @@ func (l *Ledger) CreateTransfer(ctx context.Context, r AcceptRequest) (store.Tra
 // TopUp accepts a Transfer from the funding System account into a Wallet.
 func (l *Ledger) TopUp(ctx context.Context, key string, hash []byte, walletID uuid.UUID, amount int64) (store.Transfer, error) {
 	return l.accept(ctx, TypeTopUp, CaptureAuto,
-		AcceptRequest{Key: key, Hash: hash, SourceID: l.fundingID, DestID: walletID, Amount: amount})
+		AcceptRequest{Key: key, Hash: hash, SourceID: l.fundingFor(walletID), DestID: walletID, Amount: amount})
 }
 
 // Withdraw accepts a Transfer from a Wallet into the funding System account.
 func (l *Ledger) Withdraw(ctx context.Context, key string, hash []byte, walletID uuid.UUID, amount int64) (store.Transfer, error) {
 	return l.accept(ctx, TypeWithdrawal, CaptureAuto,
-		AcceptRequest{Key: key, Hash: hash, SourceID: walletID, DestID: l.fundingID, Amount: amount})
+		AcceptRequest{Key: key, Hash: hash, SourceID: walletID, DestID: l.fundingFor(walletID), Amount: amount})
 }
 
 // Repay accepts a Repayment from a Wallet into its own receivable System
 // account. It's the one debit an open Receivable doesn't block.
 func (l *Ledger) Repay(ctx context.Context, key string, hash []byte, walletID uuid.UUID, amount int64) (store.Transfer, error) {
-	recvID, err := store.ReceivableAccountID(ctx, l.db, walletID)
+	recvID, err := store.ReceivableAccountID(ctx, l.shards.For(walletID), walletID)
 	if errors.Is(err, store.ErrAccountNotFound) {
 		return store.Transfer{}, invalid("wallet_id has no receivable to repay.")
 	}
@@ -52,6 +52,18 @@ func (l *Ledger) Repay(ctx context.Context, key string, hash []byte, walletID uu
 	}
 	return l.accept(ctx, TypeRepayment, CaptureAuto,
 		AcceptRequest{Key: key, Hash: hash, SourceID: walletID, DestID: recvID, Amount: amount})
+}
+
+// replayed returns the Transfer an already-claimed key points at. With 2PC the
+// key's shard can commit before the Transfer's shard, so a Transfer that
+// isn't visible yet is still in flight: the write retries, and if retries run
+// out the client gets ABORTED and retries with the same key (A§7).
+func (l *Ledger) replayed(ctx context.Context, id uuid.UUID) (store.Transfer, error) {
+	t, err := store.GetTransfer(ctx, l.shards.For(id), id)
+	if errors.Is(err, store.ErrTransferNotFound) {
+		return store.Transfer{}, fmt.Errorf("%w: transfer %s not yet committed", store.ErrVersionConflict, id)
+	}
+	return t, err
 }
 
 // endpoints is which Account kind each Transfer type may use as source and
@@ -128,23 +140,36 @@ func (l *Ledger) accept(ctx context.Context, typ, captureMode string, r AcceptRe
 
 	var out store.Transfer
 	var claimed bool
-	err = l.runCAS(ctx, "accept", func(tx pgx.Tx) error {
+	err = l.runX(ctx, "accept", func(x *store.XTx) error {
+		ktx, err := x.On(l.keyShard(r.Key))
+		if err != nil {
+			return err
+		}
 		var existing uuid.UUID
-		var err error
-		existing, claimed, err = store.ClaimIdempotencyKey(ctx, tx, r.Key, r.Hash, id)
+		existing, claimed, err = store.ClaimIdempotencyKey(ctx, ktx, r.Key, r.Hash, id)
 		if err != nil {
 			return err
 		}
 		if !claimed {
-			out, err = store.GetTransfer(ctx, tx, existing)
+			out, err = l.replayed(ctx, existing)
 			return err
 		}
 
+		tx, err := x.For(r.SourceID)
+		if err != nil {
+			return err
+		}
 		src, err := l.account(ctx, tx, r.SourceID)
 		if err != nil {
 			return err
 		}
-		dst, err := l.account(ctx, tx, r.DestID)
+		// A destination on another shard is read outside the tx from its own
+		// shard. Accounts are never deleted, so the read can't go stale (A§9.2).
+		var dq store.Querier = tx
+		if l.shardOf(r.DestID) != l.shardOf(r.SourceID) {
+			dq = l.shards.For(r.DestID)
+		}
+		dst, err := l.account(ctx, dq, r.DestID)
 		if err != nil {
 			return err
 		}
@@ -182,6 +207,7 @@ func (l *Ledger) accept(ctx context.Context, typ, captureMode string, r AcceptRe
 			ID: id, Type: typ, SourceID: src.ID, DestID: dst.ID, Amount: r.Amount,
 		}, ttl, captureMode)
 		if err == nil {
+			x.SetHome(id)
 			l.fail("accept.before_commit")
 		}
 		return err

@@ -1,0 +1,173 @@
+package store
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"payment-ledger/internal/shard"
+)
+
+// XTx is one logical write over every shard it touches (A§9.2). It begins a
+// tx on a shard the first time the path touches it. Commit is a plain local
+// commit when only one shard was touched, and two-phase commit otherwise.
+type XTx struct {
+	ctx    context.Context
+	shards *Shards
+	txs    map[int]pgx.Tx
+	home   uuid.UUID
+}
+
+// lockTimeout bounds lock waits once a write spans shards: Postgres can't see
+// a deadlock cycle that crosses shards, so the timeout breaks it and RunX
+// retries.
+const lockTimeout = "SET LOCAL lock_timeout = '5s'"
+
+// RunX runs fn as one cross-shard write and retries it from scratch on a
+// version conflict or a cross-shard lock timeout, like RunCAS.
+func (s *Shards) RunX(ctx context.Context, attempts int, stats Counter, op string, fn func(*XTx) error) error {
+	return retryOnConflict(ctx, attempts, stats, op, func() error {
+		x := &XTx{ctx: ctx, shards: s, txs: map[int]pgx.Tx{}}
+		// Always roll back on the way out, so a panic can't leak open txs
+		// holding locks. After a commit or a PREPARE it's a harmless no-op.
+		defer x.rollback()
+		if err := fn(x); err != nil {
+			return asConflict(err)
+		}
+		return asConflict(x.commit())
+	})
+}
+
+// asConflict maps a lock timeout (SQLSTATE 55P03) onto ErrVersionConflict so
+// the write retries.
+func asConflict(err error) error {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "55P03" {
+		return fmt.Errorf("%w: %v", ErrVersionConflict, err)
+	}
+	return err
+}
+
+// On returns shard i's tx, beginning it on first use.
+func (x *XTx) On(i int) (pgx.Tx, error) {
+	if tx, ok := x.txs[i]; ok {
+		return tx, nil
+	}
+	tx, err := x.shards.pools[i].BeginTx(x.ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		return nil, fmt.Errorf("begin on shard %d: %w", i, err)
+	}
+	x.txs[i] = tx
+	if len(x.txs) == 2 { // just became distributed: bound the existing tx too
+		for _, t := range x.txs {
+			if _, err := t.Exec(x.ctx, lockTimeout); err != nil {
+				return nil, err
+			}
+		}
+	} else if len(x.txs) > 2 {
+		if _, err := tx.Exec(x.ctx, lockTimeout); err != nil {
+			return nil, err
+		}
+	}
+	return tx, nil
+}
+
+// For returns the tx of the shard that stores id.
+func (x *XTx) For(id uuid.UUID) (pgx.Tx, error) {
+	return x.On(shard.Route(id, x.shards.N()))
+}
+
+// SetHome names the Transfer this write creates or changes. Its shard holds
+// the commit decision, and its id names the 2PC (A§9.2).
+func (x *XTx) SetHome(id uuid.UUID) { x.home = id }
+
+func (x *XTx) rollback() {
+	for _, tx := range x.txs {
+		_ = tx.Rollback(x.ctx)
+	}
+}
+
+// GID is the 2PC transaction identifier for a write whose home is id. The
+// resolver routes it back to the decision's shard.
+func GID(home uuid.UUID) string { return "x-" + home.String() }
+
+// HomeOf parses a GID back to its home id, or reports false for a foreign gid.
+func HomeOf(gid string) (uuid.UUID, bool) {
+	if len(gid) < 2 || gid[:2] != "x-" {
+		return uuid.Nil, false
+	}
+	id, err := uuid.Parse(gid[2:])
+	return id, err == nil
+}
+
+func (x *XTx) commit() error {
+	switch len(x.txs) {
+	case 0:
+		return nil
+	case 1:
+		for _, tx := range x.txs {
+			return tx.Commit(x.ctx)
+		}
+	}
+	if x.home == uuid.Nil {
+		x.rollback()
+		return errors.New("cross-shard write has no home Transfer")
+	}
+	gid := GID(x.home)
+	order := make([]int, 0, len(x.txs))
+	for i := range x.txs {
+		order = append(order, i)
+	}
+	slices.Sort(order)
+
+	// Phase 1: prepare every participant in shard order.
+	var prepared []int
+	for _, i := range order {
+		tx := x.txs[i]
+		if _, err := tx.Exec(x.ctx, "PREPARE TRANSACTION '"+gid+"'"); err != nil {
+			x.abort(gid, prepared, order)
+			return fmt.Errorf("prepare on shard %d: %w", i, err)
+		}
+		// The session no longer has an open tx, so this sends a server-side
+		// no-op ROLLBACK and only returns the connection to the pool.
+		_ = tx.Rollback(x.ctx)
+		prepared = append(prepared, i)
+	}
+
+	// The commit point: once the decision row commits, the write is committed.
+	home := x.shards.For(x.home)
+	if _, err := home.Exec(x.ctx, `INSERT INTO decisions (gid) VALUES ($1)`, gid); err != nil {
+		x.abort(gid, prepared, nil)
+		return fmt.Errorf("record decision: %w", err)
+	}
+
+	// Phase 2. A failure here leaves a decided gid for the resolver to finish.
+	done := true
+	for _, i := range order {
+		if _, err := x.shards.pools[i].Exec(x.ctx, "COMMIT PREPARED '"+gid+"'"); err != nil {
+			done = false
+		}
+	}
+	if done {
+		_, _ = home.Exec(x.ctx, `DELETE FROM decisions WHERE gid = $1`, gid)
+	}
+	return nil
+}
+
+// abort undoes a write that hasn't reached its decision: prepared shards are
+// rolled back by gid, and shards still open are rolled back directly.
+func (x *XTx) abort(gid string, prepared, order []int) {
+	for _, i := range prepared {
+		_, _ = x.shards.pools[i].Exec(x.ctx, "ROLLBACK PREPARED '"+gid+"'")
+	}
+	for _, i := range order {
+		if !slices.Contains(prepared, i) {
+			_ = x.txs[i].Rollback(x.ctx)
+		}
+	}
+}

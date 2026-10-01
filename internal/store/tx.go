@@ -71,9 +71,9 @@ func count(stats Counter, key string) {
 }
 
 // GetAccount reads the Account row that a later CASAccount call will guard.
-func GetAccount(ctx context.Context, tx pgx.Tx, id uuid.UUID) (Account, error) {
+func GetAccount(ctx context.Context, q Querier, id uuid.UUID) (Account, error) {
 	a := Account{ID: id}
-	err := tx.QueryRow(ctx,
+	err := q.QueryRow(ctx,
 		`SELECT kind, normal_balance, posted, version FROM accounts WHERE id = $1`, id,
 	).Scan(&a.Kind, &a.NormalBalance, &a.Posted, &a.Version)
 	if errors.Is(err, pgx.ErrNoRows) {

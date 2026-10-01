@@ -370,11 +370,31 @@ Decided in P5.1. This section describes the Rung 4 design. §4-§6 stay authorit
 - **Idempotency keys** live on shard `hash(key) mod N`. The key namespace stays global and mismatch detection exact (Decision Log → *Sharded idempotency keys join the 2PC*).
 - **Non-goal: resharding.** N is fixed when ids are minted. A later deployment-scale experiment may revisit it.
 
-### 9.2 Accept (Hold placement)
-The Hold and the source CAS run on the source shard S. The key is claimed on shard K = `hash(key)`.
-- **K = S:** one local tx, exactly as §5.
-- **K ≠ S:** 2PC over {K, S}. Prepare the key insert on K and the Hold + CAS on S. Then record the decision, then commit both (§9.4). An in-flight duplicate blocks on K's unique index until the original resolves, and then replays.
-- The destination's existence and kind are read from its own shard **outside** the tx. Accounts are never deleted, so that read can't go stale.
+### 9.2 Cross-shard writes: one generic transaction object
+Every write path runs through a **cross-shard transaction** (`store.XTx`). It lazily begins a tx on each shard the path touches. On commit:
+- **One shard touched:** a plain local commit. That's all single-shard behavior, unchanged.
+- **Two or more:** 2PC. `PREPARE TRANSACTION` on each participant in shard order, then the decision row, then `COMMIT PREPARED` on each, then delete the decision (§9.4).
+
+The **decision lives on the operation's home shard**: the shard of the Transfer the operation creates or changes. The gid embeds that Transfer's id, so the resolver finds the decision from the gid alone. Version conflicts retry the whole object, like `RunCAS`.
+
+| Path | Participants | Home |
+|---|---|---|
+| CreateTransfer, PlaceHold, TopUp, Withdraw, Repay | key shard K = FNV-1a(key) mod N; source shard S | S |
+| ReleaseHold | K; the Hold's shard | the Hold's shard |
+| CaptureHold, Capture | K (CaptureHold only); source shard; destination shard | source shard |
+| ReverseTransfer | K; payer shard (the original Transfer is locked there); recipient shard (new Transfers and the receivable) | recipient shard |
+
+- **TopUp and Withdraw** use the funding account **on the Wallet's own shard**, so with K = S they stay local.
+- **An in-flight duplicate** blocks on K's unique index until the original commits or rolls back, then replays.
+- **Destination reads:** on another shard, the destination's existence and kind are read **outside** the tx from its own shard. Accounts are never deleted, so that read can't go stale.
+- **Foreign keys that can cross shards are dropped**, and the cross-shard checker verifies those references instead (§9.6):
+  - `idempotency_keys.transfer_id` (migration 00004): key and Transfer live on different shards.
+  - `transfers.dest_id` and `holds.dest_id` (migration 00005): the destination can be on another shard.
+  - `entries.transfer_id` (00005): a credit Entry lives on the destination's shard, while its Transfer is on the source's.
+  - `transfers.reverses_id` (00005): a reversal lives on the recipient's shard, while the original is on the payer's.
+
+  References that are always local keep their FKs: `source_id`, `entries.account_id`, a Hold's `transfer_id`, and a receivable's `debtor_wallet_id`.
+- **Distributed deadlock:** each shard only sees its own waits, so a cycle that spans shards can't be detected by Postgres. Multi-shard sessions run with `lock_timeout = 5s`, and a timeout is treated as a conflict and retried.
 
 ### 9.3 Capture: 2PC by default
 The Hold's debit lives on S and its credit on D. **D = S:** batched capture exactly as §5. **D ≠ S:** the worker (the coordinator, on S) batches Holds with the same destination shard D and runs one 2PC per batch:
@@ -400,7 +420,7 @@ The Hold's debit lives on S and its credit on D. **D = S:** batched capture exac
 
 ### 9.6 Reads and the checker
 - **Routing:** GetTransfer, GetBalance and GetBalanceAt route by id. ListEntries routes by account. ListReceivables fans out to every shard and merges by debtor id.
-- **Checker:** runs per shard (invariants 2-7), plus a global invariant 1 summed across shards. As today, it runs after the drain, when no 2PC is in flight. A prepared tx left behind is itself a violation.
+- **Checker:** runs per shard (invariants 2-7), plus a global invariant 1 summed across shards. As today, it runs after the drain, when no 2PC is in flight. A prepared tx left behind is itself a violation. It also verifies every reference whose FK was dropped (§9.2): each `dest_id`, Entry `transfer_id`, `reverses_id` and idempotency `transfer_id` resolves on the shard its id routes to.
 
 ### 9.7 TigerBeetle backend (`LEDGER_ENGINE=tigerbeetle`)
 The same API runs on a single-replica TigerBeetle, which isn't sharded: the comparison is **sharded Postgres vs one TigerBeetle**. It has full API parity using native mechanisms only, with the two gaps proven atomic by `prototypes/tb-gaps` (Decision Log → *TigerBeetle gaps close with linked chains*).

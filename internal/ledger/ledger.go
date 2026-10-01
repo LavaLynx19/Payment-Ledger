@@ -6,10 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"payment-ledger/internal/failpoint"
@@ -37,28 +37,45 @@ type Config struct {
 	CASStats     store.Counter  // per-op CAS attempts/conflicts/exhausted; nil disables
 }
 
-// runCAS runs fn as one CAS tx with retries, counting outcomes under op.
-func (l *Ledger) runCAS(ctx context.Context, op string, fn func(pgx.Tx) error) error {
-	return store.RunCAS(ctx, l.db, l.cfg.CASAttempts, l.cfg.CASStats, op, fn)
+// runX runs fn as one cross-shard write (A§9.2) with retries, counting CAS
+// outcomes under op. A write that touches one shard commits locally.
+func (l *Ledger) runX(ctx context.Context, op string, fn func(*store.XTx) error) error {
+	return l.shards.RunX(ctx, l.cfg.CASAttempts, l.cfg.CASStats, op, fn)
 }
 
 type Ledger struct {
-	shards    *store.Shards
-	db        *pgxpool.Pool // shard 0: write paths until cross-shard Accept/Capture (P5.5–P5.6)
-	cfg       Config
-	fundingID uuid.UUID
+	shards     *store.Shards
+	db         *pgxpool.Pool // shard 0, for single-shard helpers and tests
+	cfg        Config
+	fundingIDs []uuid.UUID // per shard: TopUp/Withdraw use the Wallet's own shard's (A§9.1)
 }
 
 func New(ctx context.Context, shards *store.Shards, cfg Config) (*Ledger, error) {
-	db := shards.Pool(0)
-	fundingID, err := store.FundingAccountID(ctx, db)
-	if errors.Is(err, store.ErrAccountNotFound) {
-		return nil, errors.New("funding account missing; run cmd/seed first")
+	l := &Ledger{shards: shards, db: shards.Pool(0), cfg: cfg}
+	for i := range shards.N() {
+		id, err := store.FundingAccountID(ctx, shards.Pool(i))
+		if errors.Is(err, store.ErrAccountNotFound) {
+			return nil, fmt.Errorf("shard %d: funding account missing; run cmd/seed first", i)
+		}
+		if err != nil {
+			return nil, err
+		}
+		l.fundingIDs = append(l.fundingIDs, id)
 	}
-	if err != nil {
-		return nil, err
-	}
-	return &Ledger{shards: shards, db: db, cfg: cfg, fundingID: fundingID}, nil
+	return l, nil
+}
+
+// fundingFor is the funding account on wallet's shard.
+func (l *Ledger) fundingFor(wallet uuid.UUID) uuid.UUID {
+	return l.fundingIDs[l.shardOf(wallet)]
+}
+
+// keyShard is the shard an Idempotency-Key lives on: FNV-1a(key) mod N
+// (A§9.2). With one shard it's always 0.
+func (l *Ledger) keyShard(key string) int {
+	h := fnv.New64a()
+	h.Write([]byte(key))
+	return int(h.Sum64() % uint64(l.shards.N()))
 }
 
 // Domain errors. internal/api maps each one to its A§7 reason.
@@ -90,8 +107,8 @@ var (
 
 func invalid(msg string) error { return &InvalidError{Msg: msg} }
 
-func (l *Ledger) account(ctx context.Context, tx pgx.Tx, id uuid.UUID) (store.Account, error) {
-	a, err := store.GetAccount(ctx, tx, id)
+func (l *Ledger) account(ctx context.Context, q store.Querier, id uuid.UUID) (store.Account, error) {
+	a, err := store.GetAccount(ctx, q, id)
 	if errors.Is(err, store.ErrAccountNotFound) {
 		return store.Account{}, &NotFoundError{Resource: "account", ID: id.String()}
 	}

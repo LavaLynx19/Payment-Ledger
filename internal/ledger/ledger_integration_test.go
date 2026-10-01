@@ -243,7 +243,7 @@ func TestWithdraw(t *testing.T) {
 	ctx := context.Background()
 	w := wallets(t, l, 1)[0]
 	fund(t, l, w, 100)
-	fundingBefore := balance(t, l, l.fundingID).Posted
+	fundingBefore := balance(t, l, l.fundingIDs[0]).Posted
 
 	if _, err := l.Withdraw(ctx, key(), []byte("h"), w, 70); err != nil {
 		t.Fatal(err)
@@ -257,12 +257,12 @@ func TestWithdraw(t *testing.T) {
 		t.Errorf("wallet posted = %d, want 30", got)
 	}
 	// Funding is debit-normal (simulated cash at bank), so a Withdrawal credits it down.
-	if got := balance(t, l, l.fundingID).Posted; got != fundingBefore-70 {
+	if got := balance(t, l, l.fundingIDs[0]).Posted; got != fundingBefore-70 {
 		t.Errorf("funding posted = %d, want %d", got, fundingBefore-70)
 	}
 
 	var inv *InvalidError
-	if _, err := l.Withdraw(ctx, key(), []byte("h"), l.fundingID, 1); !errors.As(err, &inv) {
+	if _, err := l.Withdraw(ctx, key(), []byte("h"), l.fundingIDs[0], 1); !errors.As(err, &inv) {
 		t.Errorf("withdraw from funding err = %v, want InvalidError", err)
 	}
 }
@@ -279,7 +279,7 @@ func TestAcceptValidation(t *testing.T) {
 	}{
 		{"zero amount", AcceptRequest{SourceID: w, DestID: missing, Amount: 0}},
 		{"same account", AcceptRequest{SourceID: w, DestID: w, Amount: 1}},
-		{"funding as p2p source", AcceptRequest{SourceID: l.fundingID, DestID: w, Amount: 1}},
+		{"funding as p2p source", AcceptRequest{SourceID: l.fundingIDs[0], DestID: w, Amount: 1}},
 	}
 	for _, c := range cases {
 		c.req.Key, c.req.Hash = key(), []byte("h")

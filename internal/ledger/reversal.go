@@ -3,6 +3,7 @@ package ledger
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -21,11 +22,19 @@ func (e *NotReversibleError) Error() string { return e.Msg }
 // recipient returns what it has available. The rest becomes a Receivable the
 // recipient owes, and the payer is made whole either way. Either returned
 // Transfer may be nil. Replaying the key returns the same Transfers.
+//
+// Up to three shards take part (A§9.2): the key's shard, the payer's shard
+// (the original Transfer is locked there), and the recipient's shard (new
+// Transfers and the receivable), which is the home of the commit decision.
 func (l *Ledger) ReverseTransfer(ctx context.Context, key string, hash []byte, transferID uuid.UUID) (reversal, receivable *store.Transfer, err error) {
 	var claimed bool
-	err = l.runCAS(ctx, "reverse", func(tx pgx.Tx) error {
+	err = l.runX(ctx, "reverse", func(x *store.XTx) error {
 		reversal, receivable = nil, nil
-		orig, err := store.LockTransfer(ctx, tx, transferID)
+		atx, err := x.For(transferID)
+		if err != nil {
+			return err
+		}
+		orig, err := store.LockTransfer(ctx, atx, transferID)
 		if errors.Is(err, store.ErrTransferNotFound) {
 			return &NotFoundError{Resource: "transfer", ID: transferID.String()}
 		}
@@ -38,17 +47,30 @@ func (l *Ledger) ReverseTransfer(ctx context.Context, key string, hash []byte, t
 		if err != nil {
 			return err
 		}
-		_, claimed, err = store.ClaimIdempotencyKey(ctx, tx, key, hash, keyID)
+		ktx, err := x.On(l.keyShard(key))
+		if err != nil {
+			return err
+		}
+		_, claimed, err = store.ClaimIdempotencyKey(ctx, ktx, key, hash, keyID)
 		if err != nil {
 			return err
 		}
 		if !claimed {
-			reversal, receivable, err = store.ReversalsOf(ctx, tx, orig.ID)
+			reversal, receivable, err = store.ReversalsOf(ctx, l.shards.For(orig.DestID), orig.ID)
+			if err == nil && reversal == nil && receivable == nil {
+				// The key's shard committed before the recipient's: still in flight.
+				return fmt.Errorf("%w: reversal of %s not yet committed", store.ErrVersionConflict, orig.ID)
+			}
 			return err
 		}
-		if reversal, receivable, err = l.reverse(ctx, tx, orig, keyID); err != nil {
+		btx, err := x.For(orig.DestID)
+		if err != nil {
 			return err
 		}
+		if reversal, receivable, err = l.reverse(ctx, atx, btx, orig, keyID); err != nil {
+			return err
+		}
+		x.SetHome(keyID)
 		l.fail("reversal.before_commit")
 		return nil
 	})
@@ -58,14 +80,16 @@ func (l *Ledger) ReverseTransfer(ctx context.Context, key string, hash []byte, t
 	return reversal, receivable, err
 }
 
-func (l *Ledger) reverse(ctx context.Context, tx pgx.Tx, orig store.Transfer, keyID uuid.UUID) (reversal, receivable *store.Transfer, err error) {
+// reverse reads the original's Hold on the payer's shard (atx) and does
+// everything else on the recipient's shard (btx).
+func (l *Ledger) reverse(ctx context.Context, atx, btx pgx.Tx, orig store.Transfer, keyID uuid.UUID) (reversal, receivable *store.Transfer, err error) {
 	switch {
 	case orig.Type != TypeP2P:
 		return nil, nil, &NotReversibleError{Msg: "Only P2P transfers can be reversed."}
 	case orig.Status != "posted":
 		return nil, nil, &NotReversibleError{Msg: "Only posted transfers can be reversed; this one is " + orig.Status + "."}
 	}
-	priorRev, priorRecv, err := store.ReversalsOf(ctx, tx, orig.ID)
+	priorRev, priorRecv, err := store.ReversalsOf(ctx, btx, orig.ID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -73,24 +97,24 @@ func (l *Ledger) reverse(ctx context.Context, tx pgx.Tx, orig store.Transfer, ke
 		return nil, nil, &NotReversibleError{Msg: "This transfer has already been reversed."}
 	}
 
-	hold, err := store.GetHoldByTransfer(ctx, tx, orig.ID)
+	hold, err := store.GetHoldByTransfer(ctx, atx, orig.ID)
 	if err != nil {
 		return nil, nil, err
 	}
 	x := *hold.CapturedAmount // posted amount, which is less than orig.Amount after a partial capture
 	payer, recipient := orig.SourceID, orig.DestID
 
-	debtor, err := l.account(ctx, tx, recipient)
+	debtor, err := l.account(ctx, btx, recipient)
 	if err != nil {
 		return nil, nil, err
 	}
-	held, err := store.ActiveHoldTotal(ctx, tx, recipient)
+	held, err := store.ActiveHoldTotal(ctx, btx, recipient)
 	if err != nil {
 		return nil, nil, err
 	}
 	r := min(x, max(debtor.Posted-held, 0))
 
-	recv, err := store.EnsureReceivableAccount(ctx, tx, recipient)
+	recv, err := store.EnsureReceivableAccount(ctx, btx, recipient)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -98,7 +122,7 @@ func (l *Ledger) reverse(ctx context.Context, tx pgx.Tx, orig store.Transfer, ke
 	// recipient conflicts and re-reads the now-open Receivable (Decision Log).
 	versions := map[uuid.UUID]int64{debtor.ID: debtor.Version, recv.ID: recv.Version}
 	for _, id := range store.Ascending(debtor.ID, recv.ID) {
-		if _, _, err := store.CASAccount(ctx, tx, id, versions[id], 0); err != nil {
+		if _, _, err := store.CASAccount(ctx, btx, id, versions[id], 0); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -112,7 +136,7 @@ func (l *Ledger) reverse(ctx context.Context, tx pgx.Tx, orig store.Transfer, ke
 	}
 	reverses := orig.ID
 	if r > 0 {
-		t, err := store.InsertPendingTransfer(ctx, tx, store.Transfer{
+		t, err := store.InsertPendingTransfer(ctx, btx, store.Transfer{
 			ID: nextID(), Type: TypeReversal, SourceID: recipient, DestID: payer, Amount: r, ReversesID: &reverses,
 		}, 0, CaptureAuto)
 		if err != nil {
@@ -121,7 +145,7 @@ func (l *Ledger) reverse(ctx context.Context, tx pgx.Tx, orig store.Transfer, ke
 		reversal = &t
 	}
 	if short := x - r; short > 0 {
-		t, err := store.InsertPendingTransfer(ctx, tx, store.Transfer{
+		t, err := store.InsertPendingTransfer(ctx, btx, store.Transfer{
 			ID: nextID(), Type: TypeReceivable, SourceID: recv.ID, DestID: payer, Amount: short, ReversesID: &reverses,
 		}, 0, CaptureAuto)
 		if err != nil {
