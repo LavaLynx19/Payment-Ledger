@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"expvar"
 	"log"
 	"os"
 	"os/signal"
@@ -16,6 +17,7 @@ import (
 	"payment-ledger/internal/env"
 	"payment-ledger/internal/failpoint"
 	"payment-ledger/internal/ledger"
+	"payment-ledger/internal/metrics"
 	"payment-ledger/internal/store"
 )
 
@@ -33,37 +35,41 @@ func main() {
 		log.Fatalf("worker: FAILPOINTS: %v", err)
 	}
 	log.Printf("worker: failpoints: %s", fp)
+	cas := expvar.NewMap("cas")
 	l, err := ledger.New(ctx, db, ledger.Config{
 		CASAttempts:  env.Int("CAS_ATTEMPTS", 10),
 		KeyRetention: env.Duration("IDEMPOTENCY_RETENTION", 24*time.Hour),
 		Failpoints:   fp,
+		CASStats:     cas,
 	})
 	if err != nil {
 		log.Fatalf("worker: %v", err)
 	}
 
 	concurrency := env.Int("WORKER_CONCURRENCY", 4)
+	batch := env.Int("WORKER_BATCH", 100)
 	poll := env.Duration("WORKER_POLL", 20*time.Millisecond)
 	sweepEvery := env.Duration("SWEEP_INTERVAL", time.Second)
-	log.Printf("worker: %d capture loops (idle poll %s), sweeper every %s", concurrency, poll, sweepEvery)
+	log.Printf("worker: %d capture loops (batch ≤ %d, idle poll %s), sweeper every %s", concurrency, batch, poll, sweepEvery)
 
 	var wg sync.WaitGroup
 	for range concurrency {
-		wg.Go(func() { captureLoop(ctx, l, poll) })
+		wg.Go(func() { captureLoop(ctx, l, batch, poll) })
 	}
 	wg.Go(func() { sweepLoop(ctx, l, sweepEvery) })
+	wg.Go(func() { metrics.LogEvery(ctx, "cas", cas, 10*time.Second) })
 	wg.Wait()
 }
 
-// captureLoop captures back to back while Holds are waiting and sleeps for
-// poll when there are none.
-func captureLoop(ctx context.Context, l *ledger.Ledger, poll time.Duration) {
+// captureLoop captures batches back to back while Holds are waiting and
+// sleeps for poll when there are none.
+func captureLoop(ctx context.Context, l *ledger.Ledger, batch int, poll time.Duration) {
 	for ctx.Err() == nil {
-		found, err := l.CaptureNext(ctx)
+		n, err := l.CaptureBatch(ctx, batch)
 		if err != nil && ctx.Err() == nil {
 			log.Printf("worker: capture: %v", err)
 		}
-		if found && err == nil {
+		if n > 0 && err == nil {
 			continue
 		}
 		sleep(ctx, poll)
