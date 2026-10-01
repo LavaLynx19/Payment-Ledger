@@ -397,11 +397,12 @@ The **decision lives on the operation's home shard**: the shard of the Transfer 
 - **Distributed deadlock:** each shard only sees its own waits, so a cycle that spans shards can't be detected by Postgres. Multi-shard sessions run with `lock_timeout = 5s`, and a timeout is treated as a conflict and retried.
 
 ### 9.3 Capture: 2PC by default
-The Hold's debit lives on S and its credit on D. **D = S:** batched capture exactly as §5. **D ≠ S:** the worker (the coordinator, on S) batches Holds with the same destination shard D and runs one 2PC per batch:
-1. On S: claim the Holds, mark them captured, post the debits (`ApplyNet`), insert the debit Entries, and set the Transfers to `posted`. Then `PREPARE TRANSACTION 'cap-<batch id>'`.
-2. On D: post the credits and insert the credit Entries. Then `PREPARE TRANSACTION 'cap-<batch id>'`.
-3. On S, in its own tx: `INSERT INTO decisions (gid, decided_at) VALUES ('cap-…', now())`. This commit is the commit point.
-4. `COMMIT PREPARED` on S and D, then delete the decision.
+A Hold's debit lives on its source shard S and its credit on the destination's shard D. The worker claims batches **per source shard** (`FOR UPDATE SKIP LOCKED` on S, as §5), and posts each claimed batch as **one cross-shard write** (§9.2):
+- **Participants:** S plus every destination shard the batch credits. A batch with only local destinations commits locally, exactly as §5. A batch with mixed destinations commits all of its Holds atomically in one 2PC. With 2 shards that's at most S → D.
+- **Steps on S:** claim, mark captured, post the debits (`ApplyNet`), insert the debit Entries, set the Transfers to `posted`.
+- **Steps on each D:** post the credits and insert the credit Entries. Accounts are posted in ascending id order, which is a global order because the shard bits sit below the timestamp.
+- **Home:** the batch's first Transfer, on S. The gid is `x-<that id>`, and S holds the decision (§9.4).
+- **Batching by destination shard was considered and rejected.** One write per claimed batch keeps the FIFO claim simple and nets each hot Account once per batch. The cost, with more than 2 shards, is more 2PC participants per mixed batch instead of more batches.
 
 **Nothing bends:** debit and credit become visible atomically. The recipient was already credited asynchronously by capture on a single shard, so the sender's strict read-your-writes and never-negative are unchanged.
 

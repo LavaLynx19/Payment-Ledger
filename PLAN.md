@@ -56,7 +56,7 @@ This plan covers task order, verification, and commit sequence. Requirements are
 - [x] P5.3 Shard routing: UUIDv7 shard bits, one pool per shard, migrate all shards, seed per-shard funding + round-robin Wallets → §P5
 - [x] P5.4 Routed reads + ListReceivables fan-out → §P5
 - [x] P5.5 2PC Accept: key on `hash(key)` shard, `decisions` table migration → §P5
-- [ ] P5.6 2PC Capture: batches grouped by destination shard → §P5
+- [x] P5.6 2PC Capture: one cross-shard write per claimed batch (A§9.3) → §P5
 - [ ] P5.7 Resolver (presumed abort) + `twopc.*` failpoints + counters → §P5
 - [ ] P5.8 Checker: per-shard invariants 2-7, global invariant 1, no prepared tx left → §P5
 - [ ] P5.9 Saga variant (`CROSS_SHARD=saga`): outbox, relay, Entry `(transfer_id, direction)` unique, saga-aware checker → §P5
