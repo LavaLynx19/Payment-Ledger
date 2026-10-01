@@ -54,11 +54,6 @@ func runServe() {
 		log.Fatalf("api: %v", err)
 	}
 	defer shards.Close()
-	// Temporary until cross-shard Accept and Capture land (PLAN P5.5–P5.6):
-	// ledger operations still run on shard 0 only.
-	if shards.N() > 1 {
-		log.Fatalf("%s: %d shards configured; multi-shard ledger operations arrive in P5.5–P5.6", "api", shards.N())
-	}
 	fp, err := failpoint.Parse(env.Or("FAILPOINTS", ""))
 	if err != nil {
 		log.Fatalf("api: FAILPOINTS: %v", err)

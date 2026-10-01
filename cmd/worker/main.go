@@ -30,11 +30,6 @@ func main() {
 		log.Fatalf("worker: %v", err)
 	}
 	defer shards.Close()
-	// Temporary until cross-shard Accept and Capture land (PLAN P5.5–P5.6):
-	// ledger operations still run on shard 0 only.
-	if shards.N() > 1 {
-		log.Fatalf("%s: %d shards configured; multi-shard ledger operations arrive in P5.5–P5.6", "worker", shards.N())
-	}
 	fp, err := failpoint.Parse(env.Or("FAILPOINTS", ""))
 	if err != nil {
 		log.Fatalf("worker: FAILPOINTS: %v", err)
@@ -42,10 +37,11 @@ func main() {
 	log.Printf("worker: failpoints: %s", fp)
 	cas := expvar.NewMap("cas")
 	l, err := ledger.New(ctx, shards, ledger.Config{
-		CASAttempts:  env.Int("CAS_ATTEMPTS", 10),
-		KeyRetention: env.Duration("IDEMPOTENCY_RETENTION", 24*time.Hour),
-		Failpoints:   fp,
-		CASStats:     cas,
+		CASAttempts:    env.Int("CAS_ATTEMPTS", 10),
+		KeyRetention:   env.Duration("IDEMPOTENCY_RETENTION", 24*time.Hour),
+		Failpoints:     fp,
+		CASStats:       cas,
+		PrepareTimeout: env.Duration("PREPARE_TIMEOUT", 10*time.Second),
 	})
 	if err != nil {
 		log.Fatalf("worker: %v", err)
@@ -55,13 +51,16 @@ func main() {
 	batch := env.Int("WORKER_BATCH", 100)
 	poll := env.Duration("WORKER_POLL", 20*time.Millisecond)
 	sweepEvery := env.Duration("SWEEP_INTERVAL", time.Second)
-	log.Printf("worker: %d capture loops (batch ≤ %d, idle poll %s), sweeper every %s", concurrency, batch, poll, sweepEvery)
+	resolveEvery := env.Duration("RESOLVE_INTERVAL", time.Second)
+	log.Printf("worker: %d shard(s), %d capture loops (batch ≤ %d, idle poll %s), sweeper every %s, 2PC resolver every %s",
+		shards.N(), concurrency, batch, poll, sweepEvery, resolveEvery)
 
 	var wg sync.WaitGroup
 	for range concurrency {
 		wg.Go(func() { captureLoop(ctx, l, batch, poll) })
 	}
 	wg.Go(func() { sweepLoop(ctx, l, sweepEvery) })
+	wg.Go(func() { resolveLoop(ctx, l, resolveEvery) })
 	wg.Go(func() { metrics.LogEvery(ctx, "cas", cas, 10*time.Second) })
 	wg.Wait()
 }
@@ -89,6 +88,21 @@ func sweepLoop(ctx context.Context, l *ledger.Ledger, every time.Duration) {
 		}
 		if expired > 0 || purged > 0 {
 			log.Printf("worker: sweep expired %d holds, purged %d idempotency keys", expired, purged)
+		}
+		sleep(ctx, every)
+	}
+}
+
+// resolveLoop finishes in-doubt 2PC writes left by crashed coordinators
+// (A§9.4).
+func resolveLoop(ctx context.Context, l *ledger.Ledger, every time.Duration) {
+	for ctx.Err() == nil {
+		committed, rolledBack, err := l.Resolve(ctx)
+		if err != nil && ctx.Err() == nil {
+			log.Printf("worker: resolve: %v", err)
+		}
+		if committed > 0 || rolledBack > 0 {
+			log.Printf("worker: resolver committed %d and rolled back %d prepared txs", committed, rolledBack)
 		}
 		sleep(ctx, every)
 	}

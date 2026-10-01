@@ -13,6 +13,7 @@
 # Env passed to k6 when set: VUS DURATION FUNDING RATE SENDERS MAX_AMOUNT MAX_VUS HOT_DEST_SHARE TOPUP_SHARE
 # Faults: FAILPOINTS (passed to api/worker via Compose), KILL ("svc:every ..."),
 #         AGE_KEYS=1 (backdate settled keys so purge runs)
+# Shards: SHARDS=2 runs on two Postgres shards (Rung 4); default 1
 set -euo pipefail
 
 NAME="${1:?usage: harness/run.sh <rung|scenario>}"
@@ -25,6 +26,16 @@ SCRIPT="$NAME.js"
 mkdir -p "$OUT"
 export FAILPOINTS="${FAILPOINTS:-}"
 
+DBS=(postgres)
+if [[ "${SHARDS:-1}" == "2" ]]; then
+  COMPOSE+=(--profile shards)
+  DBS+=(postgres-shard1)
+  pw="${POSTGRES_PASSWORD:-ledger-dev}"
+  export SHARD_URLS="postgres://ledger:$pw@postgres:5432/ledger?sslmode=disable,postgres://ledger:$pw@postgres-shard1:5432/ledger?sslmode=disable"
+elif [[ "${SHARDS:-1}" != "1" ]]; then
+  echo "SHARDS must be 1 or 2" >&2; exit 2
+fi
+
 step() { printf '\n== %s\n' "$*"; }
 psql() { "${COMPOSE[@]}" exec -T postgres psql -U ledger -d ledger -tA "$@"; }
 
@@ -36,7 +47,7 @@ done
 step "fresh stack"
 "${COMPOSE[@]}" down -v --remove-orphans >/dev/null 2>&1
 "${COMPOSE[@]}" build --quiet
-"${COMPOSE[@]}" up -d --wait postgres
+"${COMPOSE[@]}" up -d --wait "${DBS[@]}"
 
 step "migrate + seed ${WALLETS:-10} wallets"
 "${COMPOSE[@]}" run --rm migrate
@@ -63,7 +74,7 @@ start_faults() {
 stop_faults() {
   for pid in ${faults[@]+"${faults[@]}"}; do kill "$pid" 2>/dev/null || true; done
   wait 2>/dev/null || true
-  "${COMPOSE[@]}" up -d --wait postgres api worker >/dev/null 2>&1
+  "${COMPOSE[@]}" up -d --wait "${DBS[@]}" api worker >/dev/null 2>&1
 }
 trap stop_faults EXIT
 

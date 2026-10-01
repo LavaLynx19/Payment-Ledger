@@ -407,12 +407,16 @@ A Hold's debit lives on its source shard S and its credit on the destination's s
 **Nothing bends:** debit and credit become visible atomically. The recipient was already credited asynchronously by capture on a single shard, so the sender's strict read-your-writes and never-negative are unchanged.
 
 ### 9.4 2PC recovery (decision log + resolver)
-- Each shard has a `decisions (gid PK, decided_at)` table. A resolver loop in the worker scans `pg_prepared_xacts` on every shard:
-  - If the gid's decision exists, `COMMIT PREPARED`.
-  - If no decision exists and the gid is older than `PREPARE_TIMEOUT` (default 10s), `ROLLBACK PREPARED`. That's presumed abort, safe because the decision commit is the commit point.
-- Decisions are deleted once every participant has committed.
-- New failpoints for the Rung 2 matrix: `twopc.after_prepare_source`, `twopc.after_prepare_dest`, `twopc.after_decision`, `twopc.after_commit_source`.
-- Postgres needs `max_prepared_transactions` > 0, which is a Compose change in P5.2 (ask-first).
+- **Each shard has a `decisions (gid PK, outcome, decided_at)` table.** `outcome` is `commit` or `abort`. The row on the write's home shard **arbitrates** the outcome. Both sides insert with `ON CONFLICT DO NOTHING`, and whichever row lands first decides:
+  - **Coordinator:** after preparing every participant, it inserts `commit`. If an `abort` is already there, the resolver got in first: the coordinator rolls back its prepared txs and retries the whole write, and nothing was committed.
+  - **Resolver** (a worker loop, every `RESOLVE_INTERVAL`, default 1s): it scans `pg_prepared_xacts` on every shard. For each gid it finds the home shard from the gid and reads the decision:
+    - `commit`: `COMMIT PREPARED` on that shard.
+    - `abort`, or none while the prepared tx is older than `PREPARE_TIMEOUT` (default 10s): it inserts `abort` (`ON CONFLICT DO NOTHING`), re-reads the outcome, and rolls back unless the row it reads says `commit`.
+  - **Why:** presumed abort alone is unsafe. A slow but live coordinator could write `commit` after the resolver rolled back, leaving a split outcome. Arbitrating on the primary key makes the two outcomes mutually exclusive.
+- **Cleanup:** the coordinator deletes its `commit` row after phase 2. The resolver deletes decisions older than `PREPARE_TIMEOUT` whose gid is no longer prepared on any shard.
+- **Failpoints** for the Rung 2 matrix: `twopc.after_first_prepare`, `twopc.after_all_prepared`, `twopc.after_decision`, `twopc.after_first_commit`.
+- **Counters** in the `cas` expvar map: `twopc.commits`, `twopc.aborts`, `resolve.committed`, `resolve.rolled_back`.
+- Postgres needs `max_prepared_transactions` > 0 (P5.2).
 
 ### 9.5 Saga variant (comparison only, `CROSS_SHARD=saga`)
 - **Leg 1, on S:** capture posts the debit and writes an `outbox (transfer_id, dest, amount)` row in the same tx.

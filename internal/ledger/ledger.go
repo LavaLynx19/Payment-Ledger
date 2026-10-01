@@ -35,12 +35,20 @@ type Config struct {
 	KeyRetention time.Duration  // how long idempotency keys are kept (A§2.7: 24h)
 	Failpoints   *failpoint.Set // Rung 2 crash points; nil disables all
 	CASStats     store.Counter  // per-op CAS attempts/conflicts/exhausted; nil disables
+	// PrepareTimeout is how long a 2PC may sit prepared with no decision
+	// before the resolver aborts it (A§9.4).
+	PrepareTimeout time.Duration
+}
+
+// Resolve finishes in-doubt 2PC writes on every shard (A§9.4).
+func (l *Ledger) Resolve(ctx context.Context) (committed, rolledBack int, err error) {
+	return l.shards.Resolve(ctx, l.cfg.PrepareTimeout, l.cfg.CASStats)
 }
 
 // runX runs fn as one cross-shard write (A§9.2) with retries, counting CAS
 // outcomes under op. A write that touches one shard commits locally.
 func (l *Ledger) runX(ctx context.Context, op string, fn func(*store.XTx) error) error {
-	return l.shards.RunX(ctx, l.cfg.CASAttempts, l.cfg.CASStats, op, fn)
+	return l.shards.RunX(ctx, l.cfg.CASAttempts, l.cfg.CASStats, op, l.fail, fn)
 }
 
 type Ledger struct {

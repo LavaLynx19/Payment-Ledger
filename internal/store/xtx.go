@@ -21,6 +21,8 @@ type XTx struct {
 	shards *Shards
 	txs    map[int]pgx.Tx
 	home   uuid.UUID
+	stats  Counter
+	fail   func(name string) // A§9.4 crash points; nil disables
 }
 
 // lockTimeout bounds lock waits once a write spans shards: Postgres can't see
@@ -29,10 +31,11 @@ type XTx struct {
 const lockTimeout = "SET LOCAL lock_timeout = '5s'"
 
 // RunX runs fn as one cross-shard write and retries it from scratch on a
-// version conflict or a cross-shard lock timeout, like RunCAS.
-func (s *Shards) RunX(ctx context.Context, attempts int, stats Counter, op string, fn func(*XTx) error) error {
+// version conflict, a cross-shard lock timeout, or a 2PC the resolver
+// aborted, like RunCAS. fail fires the twopc.* crash points (nil disables).
+func (s *Shards) RunX(ctx context.Context, attempts int, stats Counter, op string, fail func(string), fn func(*XTx) error) error {
 	return retryOnConflict(ctx, attempts, stats, op, func() error {
-		x := &XTx{ctx: ctx, shards: s, txs: map[int]pgx.Tx{}}
+		x := &XTx{ctx: ctx, shards: s, txs: map[int]pgx.Tx{}, stats: stats, fail: fail}
 		// Always roll back on the way out, so a panic can't leak open txs
 		// holding locks. After a commit or a PREPARE it's a harmless no-op.
 		defer x.rollback()
@@ -92,17 +95,27 @@ func (x *XTx) rollback() {
 	}
 }
 
-// GID is the 2PC transaction identifier for a write whose home is id. The
-// resolver routes it back to the decision's shard.
-func GID(home uuid.UUID) string { return "x-" + home.String() }
+// GID is a fresh 2PC transaction identifier for one attempt of a write whose
+// home is id: "x-<home>-<nonce>". The resolver routes it back to the
+// decision's shard. The nonce matters because a retried write keeps its
+// Transfer id, and its earlier attempt's gid may already be decided "abort".
+func GID(home uuid.UUID) string {
+	return "x-" + home.String() + "-" + uuid.NewString()[:8]
+}
 
 // HomeOf parses a GID back to its home id, or reports false for a foreign gid.
 func HomeOf(gid string) (uuid.UUID, bool) {
-	if len(gid) < 2 || gid[:2] != "x-" {
+	if len(gid) < 2+36 || gid[:2] != "x-" {
 		return uuid.Nil, false
 	}
-	id, err := uuid.Parse(gid[2:])
+	id, err := uuid.Parse(gid[2 : 2+36])
 	return id, err == nil
+}
+
+func (x *XTx) hit(name string) {
+	if x.fail != nil {
+		x.fail(name)
+	}
 }
 
 func (x *XTx) commit() error {
@@ -137,22 +150,39 @@ func (x *XTx) commit() error {
 		// no-op ROLLBACK and only returns the connection to the pool.
 		_ = tx.Rollback(x.ctx)
 		prepared = append(prepared, i)
+		if len(prepared) == 1 {
+			x.hit("twopc.after_first_prepare")
+		}
 	}
+	x.hit("twopc.after_all_prepared")
 
-	// The commit point: once the decision row commits, the write is committed.
+	// The commit point. The decision row arbitrates against the resolver
+	// (A§9.4): if its 'abort' got there first, this write must not commit.
 	home := x.shards.For(x.home)
-	if _, err := home.Exec(x.ctx, `INSERT INTO decisions (gid) VALUES ($1)`, gid); err != nil {
+	tag, err := home.Exec(x.ctx,
+		`INSERT INTO decisions (gid, outcome) VALUES ($1, 'commit') ON CONFLICT (gid) DO NOTHING`, gid)
+	if err != nil {
 		x.abort(gid, prepared, nil)
 		return fmt.Errorf("record decision: %w", err)
 	}
+	if tag.RowsAffected() == 0 {
+		x.abort(gid, prepared, nil)
+		count(x.stats, "twopc.aborts")
+		return fmt.Errorf("%w: resolver aborted 2PC %s first", ErrVersionConflict, gid)
+	}
+	x.hit("twopc.after_decision")
 
 	// Phase 2. A failure here leaves a decided gid for the resolver to finish.
 	done := true
-	for _, i := range order {
+	for n, i := range order {
 		if _, err := x.shards.pools[i].Exec(x.ctx, "COMMIT PREPARED '"+gid+"'"); err != nil {
 			done = false
 		}
+		if n == 0 {
+			x.hit("twopc.after_first_commit")
+		}
 	}
+	count(x.stats, "twopc.commits")
 	if done {
 		_, _ = home.Exec(x.ctx, `DELETE FROM decisions WHERE gid = $1`, gid)
 	}

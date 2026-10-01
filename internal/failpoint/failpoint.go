@@ -16,7 +16,7 @@ import (
 	"strings"
 )
 
-// Names are the crash points A§5 defines.
+// Names are the crash points A§5 and A§9.4 define.
 func Names() []string {
 	return []string{
 		"accept.before_commit", "accept.after_commit",
@@ -24,6 +24,8 @@ func Names() []string {
 		"release.before_commit",
 		"sweeper.mid_batch", "purge.mid_batch",
 		"reversal.before_commit", "reversal.after_commit",
+		"twopc.after_first_prepare", "twopc.after_all_prepared",
+		"twopc.after_decision", "twopc.after_first_commit",
 	}
 }
 

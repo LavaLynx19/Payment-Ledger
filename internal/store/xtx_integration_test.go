@@ -59,7 +59,7 @@ func TestXTxTwoPhaseCommit(t *testing.T) {
 	}
 
 	t.Run("commit lands on both shards", func(t *testing.T) {
-		err := s.RunX(ctx, 1, nil, "test", func(x *XTx) error {
+		err := s.RunX(ctx, 1, nil, "test", nil, func(x *XTx) error {
 			x.SetHome(a[0])
 			if err := bump(ctx, x, a[0]); err != nil {
 				return err
@@ -77,7 +77,7 @@ func TestXTxTwoPhaseCommit(t *testing.T) {
 
 	t.Run("error after touching both rolls back both", func(t *testing.T) {
 		boom := errors.New("boom")
-		err := s.RunX(ctx, 1, nil, "test", func(x *XTx) error {
+		err := s.RunX(ctx, 1, nil, "test", nil, func(x *XTx) error {
 			x.SetHome(a[0])
 			if err := bump(ctx, x, a[0]); err != nil {
 				return err
@@ -99,7 +99,7 @@ func TestXTxTwoPhaseCommit(t *testing.T) {
 	t.Run("panic leaks no locks", func(t *testing.T) {
 		func() {
 			defer func() { _ = recover() }()
-			_ = s.RunX(ctx, 1, nil, "test", func(x *XTx) error {
+			_ = s.RunX(ctx, 1, nil, "test", nil, func(x *XTx) error {
 				_ = bump(ctx, x, a[0])
 				_ = bump(ctx, x, b[0])
 				panic("crash")
@@ -107,7 +107,7 @@ func TestXTxTwoPhaseCommit(t *testing.T) {
 		}()
 		done := make(chan error, 1)
 		go func() {
-			done <- s.RunX(ctx, 1, nil, "test", func(x *XTx) error {
+			done <- s.RunX(ctx, 1, nil, "test", nil, func(x *XTx) error {
 				x.SetHome(a[0])
 				if err := bump(ctx, x, a[0]); err != nil {
 					return err

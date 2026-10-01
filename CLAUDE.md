@@ -23,7 +23,7 @@ Go, connect-go over h2c, pgx v5 + pgxpool, goose, PostgreSQL via Docker Compose,
 
 ## Database
 - Schema changes go in a new goose migration under `migrations/`. Applied migrations stay unchanged.
-- Tests that touch SQL run against the Compose Postgres. The invariant checker (`cmd/checker --once`) must be clean after every integration or harness run.
+- Tests that touch SQL run against the Compose Postgres. Two-shard tests run only when `SHARD_URLS` lists two shards (bring up `--profile shards`). They assert no 2PC leftovers **globally**, so run them one package at a time: `go test -p 1 ./...`. The invariant checker (`cmd/checker --once`) must be clean after every integration or harness run.
 
 ## Generated and ask-first files
 - `gen/` is buf output and is committed. Regenerate it with `go tool buf generate` after editing `proto/`. Codegen tools are pinned through go.mod's `tool` directive. k6 runs from its Docker image, and `go tool buf curl` is the smoke client.
