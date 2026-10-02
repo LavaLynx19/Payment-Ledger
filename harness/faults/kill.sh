@@ -9,7 +9,9 @@ set -euo pipefail
 SVC="${1:?usage: kill.sh <service> <every-seconds>}"
 EVERY="${2:?usage: kill.sh <service> <every-seconds>}"
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-COMPOSE=(docker compose -f "$ROOT/deploy/docker-compose.yml")
+# run.sh exports COMPOSE_FILE/COMPOSE_PROFILES so this drives the same stack.
+COMPOSE=(docker compose)
+[[ -n "${COMPOSE_FILE:-}" ]] || COMPOSE+=(-f "$ROOT/deploy/docker-compose.yml")
 
 while true; do
   sleep "$EVERY"

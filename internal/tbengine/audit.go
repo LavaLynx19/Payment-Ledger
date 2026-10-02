@@ -10,6 +10,10 @@ import (
 	"payment-ledger/internal/checker"
 )
 
+// auditBatch stays well under the client's per-request reply limit: 8,189
+// ids per LookupTransfers was rejected as too much data.
+const auditBatch = 1024
+
 // Audit checks the ledger in TigerBeetle the way the Postgres checker does,
 // with the invariants that apply to TigerBeetle's model (A§9.7), plus the
 // harness's acknowledged-Transfer check when acks is non-nil.
@@ -20,7 +24,7 @@ func (e *Engine) Audit(acks []checker.Ack) ([]checker.Result, error) {
 	control := checker.Result{Check: checker.Check{Invariant: 8, Name: "control accounts net to zero"}}
 
 	var dp, dpend, cp, cpend uint64
-	filter := tb.QueryFilter{Ledger: ledgerID, Limit: 8189}
+	filter := tb.QueryFilter{Ledger: ledgerID, Limit: auditBatch}
 	for {
 		accts, err := e.c.QueryAccounts(filter)
 		if err != nil {
@@ -59,8 +63,8 @@ func (e *Engine) Audit(acks []checker.Ack) ([]checker.Result, error) {
 	}
 
 	ackResult := checker.Result{Check: checker.AckCheck}
-	for start := 0; start < len(acks); start += 8189 {
-		batch := acks[start:min(start+8189, len(acks))]
+	for start := 0; start < len(acks); start += auditBatch {
+		batch := acks[start:min(start+auditBatch, len(acks))]
 		ids := make([]tb.Uint128, len(batch))
 		for i, a := range batch {
 			ids[i] = toTB(a.TransferID)

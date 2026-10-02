@@ -19,6 +19,8 @@
 #         TOXI=1 (api/worker reach the shards through toxiproxy),
 #         PARTITION ("shardN:every:for ...", needs TOXI=1)
 # Engine: ENGINE=postgres (default) | tigerbeetle (A§9.7)
+# Pools:  POOL_MAX_CONNS (api/worker pgx pool size per shard; default pgx's
+#         max(4, CPUs)). Bounds the 2PC admission cap (A§9.2).
 # Shards: SHARDS=2 runs on two Postgres shards (Rung 4); default 1.
 #         CROSS_SHARD=2pc (default) | saga is passed to api/worker via Compose
 set -euo pipefail
@@ -61,7 +63,20 @@ if [[ -n "${TOXI:-}" ]]; then
   COMPOSE+=(--profile faults)
   SHARD_URLS="$(join "${PROXIED[@]}")"
 fi
+if [[ -n "${POOL_MAX_CONNS:-}" ]]; then
+  SHARD_URLS="$(sed -E "s/sslmode=disable/&\\&pool_max_conns=$POOL_MAX_CONNS/g" <<< "$SHARD_URLS")"
+fi
 [[ -z "${PARTITION:-}" || -n "${TOXI:-}" ]] || { echo "PARTITION needs TOXI=1" >&2; exit 2; }
+
+# Fault scripts run their own docker compose; the same files, profiles and
+# shard list reach them through the environment.
+files=() profiles=() prev=
+for a in "${COMPOSE[@]}"; do
+  case "$prev" in -f) files+=("$a") ;; --profile) profiles+=("$a") ;; esac
+  prev=$a
+done
+export COMPOSE_FILE="$(IFS=:; echo "${files[*]}")" COMPOSE_PROFILES="$(IFS=,; echo "${profiles[*]-}")"
+export FAULT_DBS="${DBS[*]}"
 
 step() { printf '\n== %s\n' "$*"; }
 tool() { "${COMPOSE[@]}" run --rm -T -e SHARD_URLS="$direct_urls" "$@"; }

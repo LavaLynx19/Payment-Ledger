@@ -47,7 +47,8 @@ function op(method, body) {
   const r = resilient(method, body);
   if (r.gaveUp) {
     gaveUp.add(1, { op: method });
-    console.error(`${method}: gave up with outcome unknown (key ${r.key})`);
+    const last = r.res ? `${r.res.status} ${JSON.stringify(r.res.error)}` : 'no response';
+    console.error(`${method}: gave up with outcome unknown (key ${r.key}; last: ${last})`);
   } else if (code(r.res.status) === code(grpc.StatusOK)) {
     ok.add(1, { op: method });
   } else if (EXPECTED[method].map(code).includes(code(r.res.status))) {
