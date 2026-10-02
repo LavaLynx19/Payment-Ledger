@@ -134,3 +134,48 @@ func TestXTxTwoPhaseCommit(t *testing.T) {
 		}
 	})
 }
+
+// Writes that open the two shards in opposite orders, with more of them than
+// either pool has connections, must all finish (A§9.2 admission cap). Without
+// the cap each pool fills with txs waiting on the other and they all time out.
+func TestXTxPoolsCannotDeadlock(t *testing.T) {
+	_, urls := twoShards(t)
+	ctx := context.Background()
+	small := make([]string, len(urls))
+	for i, u := range urls {
+		small[i] = u + "&pool_max_conns=2"
+	}
+	s, err := OpenShards(ctx, small)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	const writers = 16
+	errs := make(chan error, writers)
+	for w := range writers {
+		a, b := pair(t, s)
+		first, second := a, b
+		if w%2 == 1 {
+			first, second = b, a
+		}
+		go func() {
+			ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			defer cancel()
+			errs <- s.RunX(ctx, 1, nil, "test", nil, func(x *XTx) error {
+				x.SetHome(first)
+				if err := bump(ctx, x, first); err != nil {
+					return err
+				}
+				time.Sleep(20 * time.Millisecond) // hold the first shard's connection
+				return bump(ctx, x, second)
+			})
+		}()
+	}
+	for range writers {
+		if err := <-errs; err != nil {
+			t.Error(err)
+		}
+	}
+	noLeftovers(t, s)
+}

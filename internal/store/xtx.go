@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -30,11 +31,23 @@ type XTx struct {
 // retries.
 const lockTimeout = "SET LOCAL lock_timeout = '5s'"
 
+// commitTimeout bounds the 2PC commit phase, which runs detached from the
+// request's cancellation (A§9.4). It matches PREPARE_TIMEOUT's default.
+const commitTimeout = 10 * time.Second
+
 // RunX runs fn as one cross-shard write and retries it from scratch on a
 // version conflict, a cross-shard lock timeout, or a 2PC the resolver
 // aborted, like RunCAS. fail fires the twopc.* crash points (nil disables).
 func (s *Shards) RunX(ctx context.Context, attempts int, stats Counter, op string, fail func(string), fn func(*XTx) error) error {
 	return retryOnConflict(ctx, attempts, stats, op, func() error {
+		if s.admit != nil {
+			select {
+			case s.admit <- struct{}{}:
+				defer func() { <-s.admit }()
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 		x := &XTx{ctx: ctx, shards: s, txs: map[int]pgx.Tx{}, stats: stats, fail: fail}
 		// Always roll back on the way out, so a panic can't leak open txs
 		// holding locks. After a commit or a PREPARE it's a harmless no-op.
@@ -132,6 +145,10 @@ func (x *XTx) commit() error {
 		return errors.New("cross-shard write has no home Transfer")
 	}
 	gid := GID(x.home)
+	// From the first PREPARE on, a client deadline must not strand a
+	// prepared tx holding locks: the rest runs detached, bounded (A§9.4).
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(x.ctx), commitTimeout)
+	defer cancel()
 	order := make([]int, 0, len(x.txs))
 	for i := range x.txs {
 		order = append(order, i)
@@ -142,13 +159,13 @@ func (x *XTx) commit() error {
 	var prepared []int
 	for _, i := range order {
 		tx := x.txs[i]
-		if _, err := tx.Exec(x.ctx, "PREPARE TRANSACTION '"+gid+"'"); err != nil {
-			x.abort(gid, prepared, order)
+		if _, err := tx.Exec(ctx, "PREPARE TRANSACTION '"+gid+"'"); err != nil {
+			x.abort(ctx, gid, prepared, order)
 			return fmt.Errorf("prepare on shard %d: %w", i, err)
 		}
 		// The session no longer has an open tx, so this sends a server-side
 		// no-op ROLLBACK and only returns the connection to the pool.
-		_ = tx.Rollback(x.ctx)
+		_ = tx.Rollback(ctx)
 		prepared = append(prepared, i)
 		if len(prepared) == 1 {
 			x.hit("twopc.after_first_prepare")
@@ -159,14 +176,14 @@ func (x *XTx) commit() error {
 	// The commit point. The decision row arbitrates against the resolver
 	// (A§9.4): if its 'abort' got there first, this write must not commit.
 	home := x.shards.For(x.home)
-	tag, err := home.Exec(x.ctx,
+	tag, err := home.Exec(ctx,
 		`INSERT INTO decisions (gid, outcome) VALUES ($1, 'commit') ON CONFLICT (gid) DO NOTHING`, gid)
 	if err != nil {
-		x.abort(gid, prepared, nil)
+		x.abort(ctx, gid, prepared, nil)
 		return fmt.Errorf("record decision: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		x.abort(gid, prepared, nil)
+		x.abort(ctx, gid, prepared, nil)
 		count(x.stats, "twopc.aborts")
 		return fmt.Errorf("%w: resolver aborted 2PC %s first", ErrVersionConflict, gid)
 	}
@@ -175,7 +192,7 @@ func (x *XTx) commit() error {
 	// Phase 2. A failure here leaves a decided gid for the resolver to finish.
 	done := true
 	for n, i := range order {
-		if _, err := x.shards.pools[i].Exec(x.ctx, "COMMIT PREPARED '"+gid+"'"); err != nil {
+		if _, err := x.shards.pools[i].Exec(ctx, "COMMIT PREPARED '"+gid+"'"); err != nil {
 			done = false
 		}
 		if n == 0 {
@@ -184,20 +201,20 @@ func (x *XTx) commit() error {
 	}
 	count(x.stats, "twopc.commits")
 	if done {
-		_, _ = home.Exec(x.ctx, `DELETE FROM decisions WHERE gid = $1`, gid)
+		_, _ = home.Exec(ctx, `DELETE FROM decisions WHERE gid = $1`, gid)
 	}
 	return nil
 }
 
 // abort undoes a write that hasn't reached its decision: prepared shards are
 // rolled back by gid, and shards still open are rolled back directly.
-func (x *XTx) abort(gid string, prepared, order []int) {
+func (x *XTx) abort(ctx context.Context, gid string, prepared, order []int) {
 	for _, i := range prepared {
-		_, _ = x.shards.pools[i].Exec(x.ctx, "ROLLBACK PREPARED '"+gid+"'")
+		_, _ = x.shards.pools[i].Exec(ctx, "ROLLBACK PREPARED '"+gid+"'")
 	}
 	for _, i := range order {
 		if !slices.Contains(prepared, i) {
-			_ = x.txs[i].Rollback(x.ctx)
+			_ = x.txs[i].Rollback(ctx)
 		}
 	}
 }

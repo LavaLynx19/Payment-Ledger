@@ -396,6 +396,7 @@ The **decision lives on the operation's home shard**: the shard of the Transfer 
 
   References that are always local keep their FKs: `source_id`, `entries.account_id`, a Hold's `transfer_id`, and a receivable's `debtor_wallet_id`.
 - **Distributed deadlock:** each shard only sees its own waits, so a cycle that spans shards can't be detected by Postgres. Multi-shard sessions run with `lock_timeout = 5s`, and a timeout is treated as a conflict and retried.
+- **Connection pools are a resource too.** An XTx holds one shard's connection while it waits for the next, so with every pool full, transfers on shard 0 can wait for shard 1 while those on shard 1 wait for shard 0. Postgres never sees that cycle. Admission control prevents it: with more than one shard, a per-process semaphore admits at most `pool_max_conns − 1` XTx at a time, the cap being the smallest pool. An XTx holds at most one transaction per shard, so a waiter can always get a connection, and the spare connection serves reads made outside the tx (destination checks, the resolver). An XTx queues on the semaphore before it holds anything.
 
 ### 9.3 Capture: 2PC by default
 A Hold's debit lives on its source shard S and its credit on the destination's shard D. The worker claims batches **per source shard** (`FOR UPDATE SKIP LOCKED` on S, as §5), and posts each claimed batch as **one cross-shard write** (§9.2):
@@ -414,6 +415,7 @@ A Hold's debit lives on its source shard S and its credit on the destination's s
     - `commit`: `COMMIT PREPARED` on that shard.
     - `abort`, or none while the prepared tx is older than `PREPARE_TIMEOUT` (default 10s): it inserts `abort` (`ON CONFLICT DO NOTHING`), re-reads the outcome, and rolls back unless the row it reads says `commit`.
   - **Why:** presumed abort alone is unsafe. A slow but live coordinator could write `commit` after the resolver rolled back, leaving a split outcome. Arbitrating on the primary key makes the two outcomes mutually exclusive.
+- **From the first PREPARE on, the request's context no longer governs.** The PREPAREs, recording the decision, phase 2 and the abort path run on `context.WithoutCancel` with their own 10s timeout (`PREPARE_TIMEOUT`'s default). A client deadline therefore can't strand a prepared tx, which would keep its locks until the resolver rolled it back. Crashes still leave prepared txs; the resolver handles those.
 - **Cleanup:** the coordinator deletes its `commit` row after phase 2. The resolver deletes decisions older than `PREPARE_TIMEOUT` whose gid is no longer prepared on any shard.
 - **Failpoints** for the Rung 2 matrix: `twopc.after_first_prepare`, `twopc.after_all_prepared`, `twopc.after_decision`, `twopc.after_first_commit`.
 - **Counters** in the `cas` expvar map: `twopc.commits`, `twopc.aborts`, `resolve.committed`, `resolve.rolled_back`.
@@ -521,3 +523,6 @@ Verdict: TigerBeetle parity uses native mechanisms only, with no app-side races.
 
 ### System-initiated Holds never expire
 Every other Hold expires, but Reversal and receivable Holds have no expiry. If the worker is down or slow, a correction must not silently fail and leave a mistaken Transfer uncorrected. The cost is that the debtor's funds stay held until the worker recovers.
+
+### 2PC admission cap instead of ordered acquisition
+P5.12's first two-shard run collapsed from 2,000 to 121 ops/s with p99 pinned at the 5s request deadline. Postgres logged no lock timeouts. The cause was a deadlock between the two connection pools: XTx opens shards lazily, so a transfer holding a shard-0 connection waits for shard 1 while another does the reverse. Pool size moved the threshold (4 connections collapsed at once, 64 ran clean), which confirmed it. We cap concurrent XTx below the pool size instead of acquiring shards in a fixed order. The cap needs no change to the XTx API or its call sites, and it rules out the deadlock by construction. The cost is that cross-shard concurrency is bounded by `pool_max_conns`. A short acquire timeout with retry was rejected: it breaks deadlocks after the fact and wastes work under load. The same runs showed client deadlines cancelling the 2PC after PREPARE, so everything after PREPARE now ignores the request's cancellation (§9.4).

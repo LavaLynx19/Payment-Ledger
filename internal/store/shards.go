@@ -13,6 +13,22 @@ import (
 // Shards holds one pool per Postgres shard, in shard-index order (A§9.1).
 type Shards struct {
 	pools []*pgxpool.Pool
+	// admit caps concurrent XTx below the smallest pool so pools can't
+	// deadlock each other (A§9.2). nil with one shard: nothing to cross.
+	admit chan struct{}
+}
+
+func newShards(pools []*pgxpool.Pool) *Shards {
+	s := &Shards{pools: pools}
+	if len(pools) > 1 {
+		limit := pools[0].Config().MaxConns
+		for _, p := range pools[1:] {
+			limit = min(limit, p.Config().MaxConns)
+		}
+		// One connection stays free for reads made outside the tx.
+		s.admit = make(chan struct{}, max(limit-1, 1))
+	}
+	return s
 }
 
 // OpenShards connects a pool to every shard URL.
@@ -20,21 +36,21 @@ func OpenShards(ctx context.Context, urls []string) (*Shards, error) {
 	if len(urls) == 0 || len(urls) > shard.Max {
 		return nil, fmt.Errorf("need 1 to %d shard URLs, got %d", shard.Max, len(urls))
 	}
-	s := &Shards{}
+	var pools []*pgxpool.Pool
 	for i, u := range urls {
 		pool, err := Open(ctx, u)
 		if err != nil {
-			s.Close()
+			newShards(pools).Close()
 			return nil, fmt.Errorf("shard %d: %w", i, err)
 		}
-		s.pools = append(s.pools, pool)
+		pools = append(pools, pool)
 	}
-	return s, nil
+	return newShards(pools), nil
 }
 
 // NewShards wraps already-open pools, in shard-index order. Close closes them.
 func NewShards(pools ...*pgxpool.Pool) *Shards {
-	return &Shards{pools: pools}
+	return newShards(pools)
 }
 
 // MigrateAll applies pending migrations to every shard.
