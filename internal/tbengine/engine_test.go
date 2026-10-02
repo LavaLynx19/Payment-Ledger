@@ -13,6 +13,7 @@ import (
 
 	"payment-ledger/internal/api"
 	"payment-ledger/internal/ledger"
+	"payment-ledger/internal/store"
 )
 
 var _ api.Engine = (*Engine)(nil)
@@ -218,4 +219,140 @@ func TestHistoryReads(t *testing.T) {
 	if err != nil || len(page) != 1 || more || page[0].Direction != "debit" || page[0].BalanceAfter != 70 {
 		t.Fatalf("page 2 = %+v more=%v err=%v", page, more, err)
 	}
+}
+
+// paid runs a posted 100 from a fresh payer to a fresh recipient, then the
+// recipient spends `spent` of it to a third Wallet.
+func paid(t *testing.T, e *Engine, spent int64) (payer, recipient uuid.UUID, transferID uuid.UUID) {
+	t.Helper()
+	ctx := context.Background()
+	ws := wallets(t, e, 3)
+	fund(t, e, ws[0], 100)
+	tr, err := e.CreateTransfer(ctx, ledger.AcceptRequest{Key: key(), SourceID: ws[0], DestID: ws[1], Amount: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spent > 0 {
+		if _, err := e.CreateTransfer(ctx, ledger.AcceptRequest{Key: key(), SourceID: ws[1], DestID: ws[2], Amount: spent}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return ws[0], ws[1], tr.ID
+}
+
+func amountOrZero(tr *store.Transfer) int64 {
+	if tr == nil {
+		return 0
+	}
+	return tr.Amount
+}
+
+func TestReversalAndReceivableRules(t *testing.T) {
+	e := testEngine(t)
+	ctx := context.Background()
+
+	for _, c := range []struct {
+		name             string
+		spent, rev, recv int64
+	}{
+		{"fully recoverable", 0, 100, 0},
+		{"partly spent", 80, 20, 80},
+		{"fully spent", 100, 0, 100},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			payer, recipient, id := paid(t, e, c.spent)
+			rev, recv, err := e.ReverseTransfer(ctx, key(), nil, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if amountOrZero(rev) != c.rev || amountOrZero(recv) != c.recv {
+				t.Fatalf("reversal=%d receivable=%d, want %d/%d", amountOrZero(rev), amountOrZero(recv), c.rev, c.recv)
+			}
+			if rev != nil && (rev.DestID != payer || rev.SourceID != recipient || *rev.ReversesID != id) {
+				t.Errorf("reversal shown as %s→%s reversing %v, want recipient→payer reversing %s", rev.SourceID, rev.DestID, rev.ReversesID, id)
+			}
+			if b := balance(t, e, payer); b.Posted != 100 {
+				t.Errorf("payer posted = %d, want 100 (made whole)", b.Posted)
+			}
+			if b := balance(t, e, recipient); b.Posted != 0 || b.ReceivableOwed != c.recv {
+				t.Errorf("recipient posted=%d owed=%d, want 0/%d", b.Posted, b.ReceivableOwed, c.recv)
+			}
+			// A second reversal (any key) replays: no money moves twice.
+			if _, _, err := e.ReverseTransfer(ctx, key(), nil, id); err != nil {
+				t.Fatal(err)
+			}
+			if b := balance(t, e, payer); b.Posted != 100 {
+				t.Errorf("after second reversal payer posted = %d, want 100", b.Posted)
+			}
+		})
+	}
+
+	t.Run("open receivable blocks debits until repaid", func(t *testing.T) {
+		_, debtor, id := paid(t, e, 80)
+		if _, _, err := e.ReverseTransfer(ctx, key(), nil, id); err != nil {
+			t.Fatal(err)
+		}
+		other := wallets(t, e, 1)[0]
+		fund(t, e, debtor, 100) // enough that only the receivable limits an overpayment
+
+		var owes *ledger.ReceivableOpenError
+		debits := map[string]func() error{
+			"transfer": func() error {
+				_, err := e.CreateTransfer(ctx, ledger.AcceptRequest{Key: key(), SourceID: debtor, DestID: other, Amount: 1})
+				return err
+			},
+			"withdraw": func() error { _, err := e.Withdraw(ctx, key(), nil, debtor, 1); return err },
+			"hold": func() error {
+				_, _, err := e.PlaceHold(ctx, ledger.AcceptRequest{Key: key(), SourceID: debtor, DestID: other, Amount: 1})
+				return err
+			},
+		}
+		for name, debit := range debits {
+			if err := debit(); !errors.As(err, &owes) || owes.Owed != 80 {
+				t.Errorf("%s err = %v, want receivable open (owes 80)", name, err)
+			}
+		}
+
+		if _, err := e.Repay(ctx, key(), nil, debtor, 50); err != nil {
+			t.Fatal(err)
+		}
+		var inv *ledger.InvalidError
+		if _, err := e.Repay(ctx, key(), nil, debtor, 31); !errors.As(err, &inv) {
+			t.Errorf("overpay err = %v, want invalid (TigerBeetle refuses it)", err)
+		}
+		if _, err := e.Repay(ctx, key(), nil, debtor, 30); err != nil {
+			t.Fatal(err)
+		}
+		if b := balance(t, e, debtor); b.ReceivableOwed != 0 {
+			t.Errorf("owed = %d after paying off, want 0", b.ReceivableOwed)
+		}
+		if err := debits["transfer"](); err != nil {
+			t.Errorf("transfer after paying off: %v", err)
+		}
+	})
+
+	t.Run("list receivables", func(t *testing.T) {
+		_, debtor, id := paid(t, e, 100)
+		if _, _, err := e.ReverseTransfer(ctx, key(), nil, id); err != nil {
+			t.Fatal(err)
+		}
+		find := func(minAge time.Duration) *store.Receivable {
+			rs, _, err := e.ListReceivables(ctx, minAge, uuid.Nil, ledger.MaxPage)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := range rs {
+				if rs[i].DebtorWalletID == debtor {
+					return &rs[i]
+				}
+			}
+			return nil
+		}
+		if r := find(0); r == nil || r.Owed != 100 {
+			t.Errorf("receivable = %+v, want debtor owing 100", r)
+		}
+		if find(time.Hour) != nil {
+			t.Error("min_age=1h listed a receivable opened just now")
+		}
+	})
 }

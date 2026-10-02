@@ -470,6 +470,13 @@ The same API runs on a single-replica TigerBeetle, which isn't sharded: the comp
 - **Failed ids are permanent.** TigerBeetle remembers a transfer id that failed for a transient reason (e.g. `exceeds_credits`) and answers a later retry with `id_already_failed`. Because the id derives from the Idempotency-Key, a client that retries the same key after topping up can never succeed and must use a new key. The engine reports it as `INVALID_REQUEST`. In Postgres a rejected Accept rolls back its key, so a later retry can succeed.
 - **Settling a Hold twice:** see the capture/release note above.
 
+**Receivable rules (P5.11), native chains from `prototypes/tb-gaps`:**
+- **Each Wallet is created with its receivable account** (code receivable, `credits_must_not_exceed_debits`, `user_data_128` = debtor), so the guard below always has a target.
+- **Guarded debits.** Every Wallet debit except a Repayment (P2P, Withdraw, PlaceHold) is linked with a `balancing_credit` from a zero-balance control account D into the debtor's receivable. The chain fails when anything is owed, which maps to `RECEIVABLE_OPEN`.
+- **Repay** credits the receivable, and an overpayment is refused by TigerBeetle itself.
+- **ReverseTransfer** is one linked chain through a control account C: C→payer X; recipient→C `balancing_debit` X (moves r); receivable→C `balancing_credit` X (moves X − r). C nets to zero after every reversal, so one shared C works. The engine presents the result as Postgres does: a reversal (recipient → payer, r) and a receivable (receivable → payer, X − r), with `reverses_id` stored in `user_data_128`. **Parity limit:** the chain's ids derive from the original Transfer, so TigerBeetle enforces "reverse at most once" itself, but a second reversal with a new key replays the first, where Postgres returns `TRANSFER_NOT_REVERSIBLE`.
+- **ListReceivables** queries receivable accounts and keeps those owing. `opened_at` is when the current run of non-zero balance began, from the account's balance history.
+
 ### 9.8 Rung 4 measurements (P5.4)
 The Rung 1 baseline, Rung 3 hot runs and Rung 2 fault matrix are run on: sharded Postgres with 2PC, sharded Postgres with the saga, and TigerBeetle. Results are reported as ratios, since everything shares one machine. Cross-shard share and 2PC counts come from new expvar counters (`twopc.*`, `saga.*`).
 

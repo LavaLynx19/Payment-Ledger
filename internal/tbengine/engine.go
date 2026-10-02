@@ -13,7 +13,6 @@ package tbengine
 import (
 	"context"
 	"crypto/sha256"
-	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -38,6 +37,9 @@ const (
 	codeControl    uint16 = 4
 )
 
+// codeGuard marks control transfers: the receivable guard on Wallet debits.
+const codeGuard uint16 = 9
+
 // Transfer codes, one per transfer type.
 var typeCodes = map[string]uint16{
 	ledger.TypeP2P: 1, ledger.TypeTopUp: 2, ledger.TypeWithdrawal: 3,
@@ -57,6 +59,8 @@ type Engine struct {
 	c       tb.Client
 	holdTTL time.Duration
 	funding uuid.UUID
+	guard   uuid.UUID // control D: zero balance, never debited; the receivable guard's source
+	revC    uuid.UUID // control C: nets to zero; routes reversal chains
 }
 
 // New connects to TigerBeetle and makes sure the funding account exists.
@@ -69,8 +73,13 @@ func New(address string, holdTTL time.Duration) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("tigerbeetle client: %w", err)
 	}
-	e := &Engine{c: c, holdTTL: holdTTL, funding: derive("funding")}
-	if err := e.createAccounts(account(e.funding, codeFunding, tb.AccountFlags{History: true})); err != nil {
+	e := &Engine{c: c, holdTTL: holdTTL, funding: derive("funding"),
+		guard: derive("control-guard"), revC: derive("control-reversal")}
+	if err := e.createAccounts(
+		account(e.funding, codeFunding, tb.AccountFlags{History: true}),
+		account(e.guard, codeControl, tb.AccountFlags{DebitsMustNotExceedCredits: true}),
+		account(e.revC, codeControl, tb.AccountFlags{}),
+	); err != nil {
 		c.Close()
 		return nil, err
 	}
@@ -101,18 +110,22 @@ func resolve(address string) (string, error) {
 // FundingID is the funding System account (one: TigerBeetle isn't sharded).
 func (e *Engine) FundingID() uuid.UUID { return e.funding }
 
-// CreateWallets creates n Wallets that can never go negative, with balance
-// history for point-in-time reads.
+// CreateWallets creates n Wallets that can never go negative, each with its
+// receivable account (so the receivable guard always has a target), all with
+// balance history for point-in-time reads.
 func (e *Engine) CreateWallets(n int) ([]uuid.UUID, error) {
 	ids := make([]uuid.UUID, n)
-	accounts := make([]tb.Account, n)
+	accounts := make([]tb.Account, 0, 2*n)
 	for i := range ids {
 		id, err := shard.NewID(0)
 		if err != nil {
 			return nil, err
 		}
 		ids[i] = id
-		accounts[i] = account(id, codeWallet, tb.AccountFlags{DebitsMustNotExceedCredits: true, History: true})
+		recv := account(receivableID(id), codeReceivable, tb.AccountFlags{CreditsMustNotExceedDebits: true, History: true})
+		recv.UserData128 = toTB(id) // the debtor
+		accounts = append(accounts,
+			account(id, codeWallet, tb.AccountFlags{DebitsMustNotExceedCredits: true, History: true}), recv)
 	}
 	return ids, e.createAccounts(accounts...)
 }
@@ -297,21 +310,61 @@ func (e *Engine) outcome(status tb.CreateTransferStatus, src uuid.UUID, amount i
 
 // postNow posts one transfer atomically (single-phase).
 func (e *Engine) postNow(typ, key string, src, dst uuid.UUID, amount int64) (store.Transfer, error) {
-	if _, _, err := e.prepare(typ, src, dst, amount); err != nil {
-		return store.Transfer{}, err
-	}
-	id := keyID(key)
-	st, err := e.submit(tb.Transfer{
-		ID: toTB(id), DebitAccountID: toTB(src), CreditAccountID: toTB(dst),
-		Amount: u128(amount), Ledger: ledgerID, Code: typeCodes[typ],
-	})
+	s, _, err := e.prepare(typ, src, dst, amount)
 	if err != nil {
 		return store.Transfer{}, err
 	}
-	if err := e.outcome(st[0], src, amount); err != nil {
+	id := keyID(key)
+	t := tb.Transfer{
+		ID: toTB(id), DebitAccountID: toTB(src), CreditAccountID: toTB(dst),
+		Amount: u128(amount), Ledger: ledgerID, Code: typeCodes[typ],
+	}
+	if err := e.submitDebit(t, key, guarded(typ, s), src, amount); err != nil {
 		return store.Transfer{}, err
 	}
 	return e.GetTransfer(context.Background(), id)
+}
+
+// guarded reports whether a debit must pass the receivable guard: every
+// Wallet debit except a Repayment (A§9.7).
+func guarded(typ string, src tb.Account) bool {
+	return src.Code == codeWallet && typ != ledger.TypeRepayment
+}
+
+// submitDebit sends t. When guarded, t is linked with a balancing_credit from
+// control D into the debtor's receivable. That moves exactly what's owed, and D
+// can't go negative, so the chain fails iff something is owed
+// (prototypes/tb-gaps).
+func (e *Engine) submitDebit(t tb.Transfer, key string, guard bool, src uuid.UUID, amount int64) error {
+	if !guard {
+		st, err := e.submit(t)
+		if err != nil {
+			return err
+		}
+		return e.outcome(st[0], src, amount)
+	}
+	t.Flags |= tb.TransferFlags{Linked: true}.ToUint16()
+	st, err := e.submit(t, tb.Transfer{
+		ID: toTB(derive("guard", key)), DebitAccountID: toTB(e.guard), CreditAccountID: toTB(receivableID(src)),
+		Amount: tb.AmountMax, Ledger: ledgerID, Code: codeGuard,
+		Flags: tb.TransferFlags{BalancingCredit: true}.ToUint16(),
+	})
+	if err != nil {
+		return err
+	}
+	switch {
+	case st[0] == tb.TransferExists:
+		return nil // a replay of a debit that already succeeded
+	case st[0] == tb.TransferLinkedEventFailed && st[1] == tb.TransferExceedsCredits:
+		owed, err := e.owed(src)
+		if err != nil {
+			return err
+		}
+		return &ledger.ReceivableOpenError{Owed: owed}
+	case st[0] == tb.TransferLinkedEventFailed && st[1] != tb.TransferCreated:
+		return fmt.Errorf("tigerbeetle receivable guard: %s", st[1])
+	}
+	return e.outcome(st[0], src, amount)
 }
 
 func (e *Engine) CreateTransfer(_ context.Context, r ledger.AcceptRequest) (store.Transfer, error) {
@@ -326,15 +379,6 @@ func (e *Engine) Withdraw(_ context.Context, key string, _ []byte, wallet uuid.U
 	return e.postNow(ledger.TypeWithdrawal, key, wallet, e.funding, amount)
 }
 
-// Repay and ReverseTransfer arrive with the Receivable rules (PLAN P5.11).
-func (e *Engine) Repay(context.Context, string, []byte, uuid.UUID, int64) (store.Transfer, error) {
-	return store.Transfer{}, fmt.Errorf("tigerbeetle Repay: %w (P5.11)", errors.ErrUnsupported)
-}
-
-func (e *Engine) ReverseTransfer(context.Context, string, []byte, uuid.UUID) (*store.Transfer, *store.Transfer, error) {
-	return nil, nil, fmt.Errorf("tigerbeetle ReverseTransfer: %w (P5.11)", errors.ErrUnsupported)
-}
-
 // ---- holds ----
 
 // timeoutSeconds rounds a TTL up to TigerBeetle's whole seconds (A§9.7).
@@ -343,7 +387,8 @@ func timeoutSeconds(ttl time.Duration) uint32 {
 }
 
 func (e *Engine) PlaceHold(ctx context.Context, r ledger.AcceptRequest) (store.Transfer, store.Hold, error) {
-	if _, _, err := e.prepare(ledger.TypeP2P, r.SourceID, r.DestID, r.Amount); err != nil {
+	s, _, err := e.prepare(ledger.TypeP2P, r.SourceID, r.DestID, r.Amount)
+	if err != nil {
 		return store.Transfer{}, store.Hold{}, err
 	}
 	ttl := r.HoldTTL
@@ -351,15 +396,12 @@ func (e *Engine) PlaceHold(ctx context.Context, r ledger.AcceptRequest) (store.T
 		ttl = e.holdTTL
 	}
 	id := keyID(r.Key)
-	st, err := e.submit(tb.Transfer{
+	t := tb.Transfer{
 		ID: toTB(id), DebitAccountID: toTB(r.SourceID), CreditAccountID: toTB(r.DestID),
 		Amount: u128(r.Amount), Ledger: ledgerID, Code: typeCodes[ledger.TypeP2P],
 		Timeout: timeoutSeconds(ttl), Flags: tb.TransferFlags{Pending: true}.ToUint16(),
-	})
-	if err != nil {
-		return store.Transfer{}, store.Hold{}, err
 	}
-	if err := e.outcome(st[0], r.SourceID, r.Amount); err != nil {
+	if err := e.submitDebit(t, r.Key, guarded(ledger.TypeP2P, s), r.SourceID, r.Amount); err != nil {
 		return store.Transfer{}, store.Hold{}, err
 	}
 	return e.holdState(ctx, id)
@@ -515,7 +557,7 @@ func (e *Engine) GetTransfer(ctx context.Context, id uuid.UUID) (store.Transfer,
 		t, _, err := e.holdState(ctx, id)
 		return t, err
 	}
-	return transferView(ts[0]), nil
+	return e.view(ts[0])
 }
 
 func (e *Engine) GetBalance(ctx context.Context, accountID uuid.UUID) (ledger.Balance, error) {
@@ -641,9 +683,4 @@ func (e *Engine) ListEntries(_ context.Context, accountID uuid.UUID, from, to *t
 		}
 	}
 	return out, false, nil
-}
-
-// ListReceivables arrives with the Receivable rules (PLAN P5.11).
-func (e *Engine) ListReceivables(context.Context, time.Duration, uuid.UUID, int) ([]store.Receivable, bool, error) {
-	return nil, false, fmt.Errorf("tigerbeetle ListReceivables: %w (P5.11)", errors.ErrUnsupported)
 }
