@@ -6,6 +6,7 @@ package shard
 
 import (
 	"fmt"
+	"hash/fnv"
 
 	"github.com/google/uuid"
 )
@@ -41,4 +42,12 @@ func Of(id uuid.UUID) int {
 // Route is the index of the shard that stores id when there are n shards.
 func Route(id uuid.UUID, n int) int {
 	return Of(id) % n
+}
+
+// ForKey is the shard an Idempotency-Key lives on: FNV-1a(key) mod n (A§9.2).
+// With one shard it's always 0.
+func ForKey(key string, n int) int {
+	h := fnv.New64a()
+	h.Write([]byte(key))
+	return int(h.Sum64() % uint64(n))
 }

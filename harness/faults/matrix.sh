@@ -34,7 +34,7 @@ failed=0
 verdict() { # name log status
   local crashes line
   crashes=$(grep -o 'failpoint crashes: .*' "$2" || grep -c '^fault: kill' "$2" | sed 's/^/kills: /')
-  line=$(grep -o 'lost: .*' "$2" || echo "no ACK check")
+  line=$(grep -o 'harness: acknowledged.*' "$2" | sed 's/^harness: //' || echo "no ACK check")
   printf '%-24s %-4s  %-34s  %s\n' "$1" "$([[ $3 == 0 ]] && echo PASS || echo FAIL)" "$crashes" "$line"
   [[ $3 == 0 ]] || failed=1
 }

@@ -123,8 +123,8 @@ func load(ctx context.Context, shards []store.Querier) (*view, error) {
 	return v, nil
 }
 
-func each(ctx context.Context, q store.Querier, sql string, scan func(pgx.Rows) error) error {
-	rows, err := q.Query(ctx, sql)
+func each(ctx context.Context, q store.Querier, sql string, scan func(pgx.Rows) error, args ...any) error {
+	rows, err := q.Query(ctx, sql, args...)
 	if err != nil {
 		return err
 	}

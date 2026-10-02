@@ -6,13 +6,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"payment-ledger/internal/failpoint"
+	"payment-ledger/internal/shard"
 	"payment-ledger/internal/store"
 )
 
@@ -86,13 +86,8 @@ func (l *Ledger) fundingFor(wallet uuid.UUID) uuid.UUID {
 	return l.fundingIDs[l.shardOf(wallet)]
 }
 
-// keyShard is the shard an Idempotency-Key lives on: FNV-1a(key) mod N
-// (A§9.2). With one shard it's always 0.
-func (l *Ledger) keyShard(key string) int {
-	h := fnv.New64a()
-	h.Write([]byte(key))
-	return int(h.Sum64() % uint64(l.shards.N()))
-}
+// keyShard is the shard an Idempotency-Key lives on (A§9.2).
+func (l *Ledger) keyShard(key string) int { return shard.ForKey(key, l.shards.N()) }
 
 // Domain errors. internal/api maps each one to its A§7 reason.
 
