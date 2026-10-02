@@ -49,7 +49,7 @@ func main() {
 		KeyRetention:   env.Duration("IDEMPOTENCY_RETENTION", 24*time.Hour),
 		Failpoints:     fp,
 		CASStats:       cas,
-		PrepareTimeout: env.Duration("PREPARE_TIMEOUT", 10*time.Second),
+		PrepareTimeout: env.Duration("PREPARE_TIMEOUT", 2*time.Second),
 		CrossShard:     env.Or("CROSS_SHARD", ledger.CrossShard2PC),
 	})
 	if err != nil {

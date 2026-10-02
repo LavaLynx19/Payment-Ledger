@@ -91,6 +91,7 @@ services:
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
       CAS_ATTEMPTS: ${CAS_ATTEMPTS:-10}
       FAILPOINTS: ${FAILPOINTS:-}
+      PREPARE_TIMEOUT: ${PREPARE_TIMEOUT:-2s}
 
   k6:
     image: grafana/k6:2.3.0

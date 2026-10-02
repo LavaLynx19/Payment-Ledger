@@ -33,7 +33,7 @@ const lockTimeout = "SET LOCAL lock_timeout = '5s'"
 
 // commitTimeout bounds the 2PC commit phase, which runs detached from the
 // request's cancellation (A§9.4). It matches PREPARE_TIMEOUT's default.
-const commitTimeout = 10 * time.Second
+const commitTimeout = 2 * time.Second
 
 // RunX runs fn as one cross-shard write and retries it from scratch on a
 // version conflict, a cross-shard lock timeout, or a 2PC the resolver
