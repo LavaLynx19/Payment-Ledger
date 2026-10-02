@@ -102,6 +102,8 @@ func toConnect(err error) error {
 		return ErrIdempotencyMismatch()
 	case errors.Is(err, ledger.ErrRetriesExhausted):
 		return ErrConflictRetriesExhausted()
+	case errors.Is(err, errors.ErrUnsupported):
+		return connect.NewError(connect.CodeUnimplemented, err)
 	case errors.Is(err, context.Canceled):
 		return connect.NewError(connect.CodeCanceled, err)
 	case errors.Is(err, context.DeadlineExceeded):

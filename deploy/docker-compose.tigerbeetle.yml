@@ -12,7 +12,30 @@ x-tigerbeetle: &tb
     # bind mount refuses (prototypes/tb-gaps).
     - tbdata:/data
 
+# App services built with the TigerBeetle engine (Dockerfile target `tigerbeetle`).
+x-tb-app: &tb-app
+  image: payment-ledger:tb
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+    target: tigerbeetle
+
 services:
+  migrate:
+    <<: *tb-app
+  seed:
+    <<: *tb-app
+    security_opt: ["seccomp:unconfined"]
+    environment:
+      LEDGER_ENGINE: tigerbeetle
+      TB_ADDRESS: tigerbeetle:3000
+  checker:
+    <<: *tb-app
+    security_opt: ["seccomp:unconfined"]
+    environment:
+      LEDGER_ENGINE: tigerbeetle
+      TB_ADDRESS: tigerbeetle:3000
+
   tigerbeetle-format: # one-shot; run after `down -v`
     <<: *tb
     profiles: ["tools"]
@@ -25,6 +48,7 @@ services:
       - "3033:3000"
 
   api:
+    <<: *tb-app
     security_opt: ["seccomp:unconfined"]
     environment:
       LEDGER_ENGINE: tigerbeetle
@@ -34,6 +58,7 @@ services:
         condition: service_started
 
   worker:
+    <<: *tb-app
     security_opt: ["seccomp:unconfined"]
     environment:
       LEDGER_ENGINE: tigerbeetle

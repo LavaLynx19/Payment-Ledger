@@ -25,6 +25,14 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if env.Or("LEDGER_ENGINE", "postgres") == "tigerbeetle" {
+		// Single-phase posting and native Hold timeouts leave nothing to
+		// capture, sweep or resolve (A§9.7). Idle so the restart policy doesn't loop.
+		log.Print("worker: engine tigerbeetle has no background work; idling")
+		<-ctx.Done()
+		return
+	}
+
 	shards, err := store.OpenShards(ctx, env.ShardURLs())
 	if err != nil {
 		log.Fatalf("worker: %v", err)

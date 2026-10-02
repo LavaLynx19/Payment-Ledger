@@ -49,32 +49,44 @@ func runServe() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	shards, err := store.OpenShards(ctx, env.ShardURLs())
-	if err != nil {
-		log.Fatalf("api: %v", err)
-	}
-	defer shards.Close()
-	fp, err := failpoint.Parse(env.Or("FAILPOINTS", ""))
-	if err != nil {
-		log.Fatalf("api: FAILPOINTS: %v", err)
-	}
-	log.Printf("api: failpoints: %s", fp)
 	cas := expvar.NewMap("cas")
-	l, err := ledger.New(ctx, shards, ledger.Config{
-		HoldTTL:     env.Duration("HOLD_TTL", 30*time.Second),
-		CASAttempts: env.Int("CAS_ATTEMPTS", 10),
-		Failpoints:  fp,
-		CASStats:    cas,
-	})
-	if err != nil {
-		log.Fatalf("api: %v", err)
+	var engine api.Engine
+	if env.Or("LEDGER_ENGINE", "postgres") == "tigerbeetle" {
+		e, closeEngine, err := tigerbeetleEngine(env.Must("TB_ADDRESS"), env.Duration("HOLD_TTL", 30*time.Second))
+		if err != nil {
+			log.Fatalf("api: %v", err)
+		}
+		defer closeEngine()
+		engine = e
+		log.Print("api: engine tigerbeetle")
+	} else {
+		shards, err := store.OpenShards(ctx, env.ShardURLs())
+		if err != nil {
+			log.Fatalf("api: %v", err)
+		}
+		defer shards.Close()
+		fp, err := failpoint.Parse(env.Or("FAILPOINTS", ""))
+		if err != nil {
+			log.Fatalf("api: FAILPOINTS: %v", err)
+		}
+		log.Printf("api: engine postgres, %d shard(s), failpoints: %s", shards.N(), fp)
+		l, err := ledger.New(ctx, shards, ledger.Config{
+			HoldTTL:     env.Duration("HOLD_TTL", 30*time.Second),
+			CASAttempts: env.Int("CAS_ATTEMPTS", 10),
+			Failpoints:  fp,
+			CASStats:    cas,
+		})
+		if err != nil {
+			log.Fatalf("api: %v", err)
+		}
+		engine = l
 	}
 	logged := make(chan struct{})
 	go func() { defer close(logged); metrics.LogEvery(ctx, "cas", cas, 10*time.Second) }()
 	defer func() { <-logged }() // final totals are logged before exit
 
 	mux := http.NewServeMux()
-	mux.Handle("/", api.NewHandler(api.NewService(l), tokens))
+	mux.Handle("/", api.NewHandler(api.NewService(engine), tokens))
 	mux.Handle("/debug/vars", expvar.Handler())
 
 	// HTTP/1.1 for Connect JSON clients, plaintext HTTP/2 (h2c) for gRPC clients like k6.

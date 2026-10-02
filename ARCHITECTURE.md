@@ -452,11 +452,23 @@ The same API runs on a single-replica TigerBeetle, which isn't sharded: the comp
 | Point-in-time balance, statements | `history` flag + `get_account_balances`, `get_account_transfers` |
 | Receivables list | Query the receivable accounts and filter owed > 0 in the app |
 
+**Posting model (P5.10 decision): single-phase where possible.**
+- **Posted at once:** CreateTransfer, TopUp, Withdraw, Repay and Reversal post as **one atomic TigerBeetle transfer**, with limits enforced in the engine. The API returns `POSTED`, and there's no capture worker or backlog.
+- **Two-phase only for Holds:** PlaceHold, CaptureHold and ReleaseHold use `pending` / `post_pending_transfer` / `void_pending_transfer`.
+- **Idempotency is the transfer id:** a deterministic 128-bit hash of the Idempotency-Key. Same fields replay; different fields come back as `exists_with_different_*` and map to `IDEMPOTENCY_MISMATCH`. Keys never expire, where Postgres keeps them 24h.
+- **Capture and Release use ids derived from the Hold id,** so TigerBeetle can tell a Hold's status without its own store. **Parity limit:** capturing or releasing an already-settled Hold with a *new* key returns its current state, where Postgres returns `HOLD_NOT_ACTIVE`. This is recorded as a finding.
+- **Build:** the engine compiles only with `-tags tigerbeetle`. A `tigerbeetle` Dockerfile target (cgo, `gcr.io/distroless/base-debian13` to match the build image's glibc 2.41) produces `payment-ledger:tb`, and the TigerBeetle overlay uses it. The default image stays static.
+
 **Constraints found by the prototype:**
 - The Go client's macOS native library fails to link, so TigerBeetle code builds and tests **only in Linux containers**.
 - The client needs **io_uring**, so its containers need `seccomp=unconfined`, the same as the server.
 - The data file needs a **Docker named volume**, because a macOS bind mount refuses its preallocation.
 - Client 0.17.9 is pinned to server image 0.17.9.
+- The client accepts only an IP (or a bare port), not a hostname, so the engine resolves Compose service names itself (P5.10).
+
+**Parity findings (P5.10):**
+- **Failed ids are permanent.** TigerBeetle remembers a transfer id that failed for a transient reason (e.g. `exceeds_credits`) and answers a later retry with `id_already_failed`. Because the id derives from the Idempotency-Key, a client that retries the same key after topping up can never succeed and must use a new key. The engine reports it as `INVALID_REQUEST`. In Postgres a rejected Accept rolls back its key, so a later retry can succeed.
+- **Settling a Hold twice:** see the capture/release note above.
 
 ### 9.8 Rung 4 measurements (P5.4)
 The Rung 1 baseline, Rung 3 hot runs and Rung 2 fault matrix are run on: sharded Postgres with 2PC, sharded Postgres with the saga, and TigerBeetle. Results are reported as ratios, since everything shares one machine. Cross-shard share and 2PC counts come from new expvar counters (`twopc.*`, `saga.*`).

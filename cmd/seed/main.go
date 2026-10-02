@@ -27,6 +27,18 @@ func main() {
 	wallets := flag.Int("wallets", 100, "number of Wallets to create")
 	flag.Parse()
 
+	if env.Or("LEDGER_ENGINE", "postgres") == "tigerbeetle" {
+		funding, ids, err := seedTigerBeetle(env.Must("TB_ADDRESS"), *wallets)
+		if err != nil {
+			log.Fatalf("seed: %v", err)
+		}
+		out := output{FundingID: funding, FundingIDs: []uuid.UUID{funding}, WalletIDs: ids}
+		if err := json.NewEncoder(os.Stdout).Encode(out); err != nil {
+			log.Fatalf("seed: %v", err)
+		}
+		return
+	}
+
 	ctx := context.Background()
 	shards, err := store.OpenShards(ctx, env.ShardURLs())
 	if err != nil {
