@@ -51,6 +51,9 @@ func (l *Ledger) CaptureHold(ctx context.Context, key string, hash []byte, holdI
 		if h, err = l.lockManualHold(ctx, tx, holdID); err != nil {
 			return err
 		}
+		// Named before the key claim, so a replay spanning two shards
+		// commits too (A§9.2).
+		x.SetHome(h.TransferID)
 		ktx, err := x.On(l.keyShard(key))
 		if err != nil {
 			return err
@@ -66,7 +69,6 @@ func (l *Ledger) CaptureHold(ctx context.Context, key string, hash []byte, holdI
 			if h, err = store.GetHoldByTransfer(ctx, tx, h.TransferID); err != nil {
 				return err
 			}
-			x.SetHome(h.TransferID)
 		}
 		t, err = store.GetTransfer(ctx, tx, h.TransferID)
 		return err
@@ -113,6 +115,9 @@ func (l *Ledger) ReleaseHold(ctx context.Context, key string, hash []byte, holdI
 		if h, err = l.lockManualHold(ctx, tx, holdID); err != nil {
 			return err
 		}
+		// Named before the key claim, so a replay spanning two shards
+		// commits too (A§9.2).
+		x.SetHome(h.TransferID)
 		ktx, err := x.On(l.keyShard(key))
 		if err != nil {
 			return err
@@ -142,7 +147,6 @@ func (l *Ledger) ReleaseHold(ctx context.Context, key string, hash []byte, holdI
 			return err
 		}
 		h.Status = "released"
-		x.SetHome(h.TransferID)
 		l.fail("release.before_commit")
 		return nil
 	})

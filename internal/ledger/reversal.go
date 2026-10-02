@@ -47,6 +47,9 @@ func (l *Ledger) ReverseTransfer(ctx context.Context, key string, hash []byte, t
 		if err != nil {
 			return err
 		}
+		// Named before the key claim, so a replay spanning two shards
+		// commits too (A§9.2).
+		x.SetHome(keyID)
 		ktx, err := x.On(l.keyShard(key))
 		if err != nil {
 			return err
@@ -70,7 +73,6 @@ func (l *Ledger) ReverseTransfer(ctx context.Context, key string, hash []byte, t
 		if reversal, receivable, err = l.reverse(ctx, atx, btx, orig, keyID); err != nil {
 			return err
 		}
-		x.SetHome(keyID)
 		l.fail("reversal.before_commit")
 		return nil
 	})

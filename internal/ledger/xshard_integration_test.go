@@ -191,3 +191,53 @@ func TestCrossShardAcceptsCannotOverspend(t *testing.T) {
 	}
 	noLeftovers(t, multi)
 }
+
+// A retry that finds its key already claimed replays, and its tx still spans
+// the key's shard and the Hold's or Transfer's shard. That replay must commit
+// like any cross-shard write, not fail for lack of a home (P5.12 give-ups).
+func TestCrossShardReplays(t *testing.T) {
+	multi, perShard := twoShardLedgers(t)
+	ctx := context.Background()
+	payer := walletsOn(t, perShard[0], 0, 1)[0]
+	payee := walletsOn(t, perShard[0], 0, 1)[0]
+	fund(t, perShard[0], payer, 300)
+	hold := func() uuid.UUID {
+		t.Helper()
+		_, h, err := multi.PlaceHold(ctx, AcceptRequest{Key: keyOn(multi, 0), Hash: []byte("h"), SourceID: payer, DestID: payee, Amount: 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h.ID
+	}
+
+	t.Run("ReleaseHold", func(t *testing.T) {
+		id, k := hold(), keyOn(multi, 1)
+		for attempt := range 2 {
+			if h, err := multi.ReleaseHold(ctx, k, []byte("r"), id); err != nil || h.Status != "released" {
+				t.Fatalf("attempt %d: status %q, err %v", attempt, h.Status, err)
+			}
+		}
+	})
+	t.Run("CaptureHold", func(t *testing.T) {
+		id, k := hold(), keyOn(multi, 1)
+		for attempt := range 2 {
+			if tr, _, err := multi.CaptureHold(ctx, k, []byte("c"), id, nil); err != nil || tr.Status != "posted" {
+				t.Fatalf("attempt %d: status %q, err %v", attempt, tr.Status, err)
+			}
+		}
+	})
+	t.Run("ReverseTransfer", func(t *testing.T) {
+		tr, err := multi.CreateTransfer(ctx, AcceptRequest{Key: keyOn(multi, 0), Hash: []byte("h"), SourceID: payer, DestID: payee, Amount: 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		drainAll(t, multi)
+		k := keyOn(multi, 1)
+		for attempt := range 2 {
+			if rev, _, err := multi.ReverseTransfer(ctx, k, []byte("v"), tr.ID); err != nil || rev == nil {
+				t.Fatalf("attempt %d: reversal %v, err %v", attempt, rev, err)
+			}
+		}
+	})
+	noLeftovers(t, multi)
+}
