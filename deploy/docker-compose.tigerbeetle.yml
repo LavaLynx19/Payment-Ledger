@@ -1,0 +1,71 @@
+# Overlay for TigerBeetle runs (Rung 4, A§9.7). Use with:
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.tigerbeetle.yml ...
+# Kept separate because TigerBeetle's server and client both need io_uring,
+# which Docker's default seccomp profile blocks. Only these runs loosen it.
+
+x-tigerbeetle: &tb
+  image: ghcr.io/tigerbeetle/tigerbeetle:0.17.9 # pinned to the Go client version
+  security_opt: ["seccomp:unconfined"]
+  cap_add: ["IPC_LOCK"]
+  volumes:
+    # A named volume: TigerBeetle preallocates its data file, which a macOS
+    # bind mount refuses (prototypes/tb-gaps).
+    - tbdata:/data
+
+# App services built with the TigerBeetle engine (Dockerfile target `tigerbeetle`).
+x-tb-app: &tb-app
+  image: payment-ledger:tb
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile
+    target: tigerbeetle
+
+services:
+  migrate:
+    <<: *tb-app
+  seed:
+    <<: *tb-app
+    security_opt: ["seccomp:unconfined"]
+    environment:
+      LEDGER_ENGINE: tigerbeetle
+      TB_ADDRESS: tigerbeetle:3000
+  checker:
+    <<: *tb-app
+    security_opt: ["seccomp:unconfined"]
+    environment:
+      LEDGER_ENGINE: tigerbeetle
+      TB_ADDRESS: tigerbeetle:3000
+
+  tigerbeetle-format: # one-shot; run after `down -v`
+    <<: *tb
+    profiles: ["tools"]
+    command: ["format", "--cluster=0", "--replica=0", "--replica-count=1", "--development", "/data/0_0.tigerbeetle"]
+
+  tigerbeetle:
+    <<: *tb
+    command: ["start", "--addresses=0.0.0.0:3000", "--development", "/data/0_0.tigerbeetle"]
+    ports:
+      - "3033:3000"
+
+  api:
+    <<: *tb-app
+    security_opt: ["seccomp:unconfined"]
+    environment:
+      LEDGER_ENGINE: tigerbeetle
+      TB_ADDRESS: tigerbeetle:3000
+    depends_on:
+      tigerbeetle:
+        condition: service_started
+
+  worker:
+    <<: *tb-app
+    security_opt: ["seccomp:unconfined"]
+    environment:
+      LEDGER_ENGINE: tigerbeetle
+      TB_ADDRESS: tigerbeetle:3000
+    depends_on:
+      tigerbeetle:
+        condition: service_started
+
+volumes:
+  tbdata: {}

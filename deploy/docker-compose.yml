@@ -1,5 +1,20 @@
 name: payment-ledger
 
+# Both Postgres shards share this config. max_prepared_transactions enables
+# the Rung 4 2PC (PREPARE TRANSACTION).
+x-postgres: &pg
+  image: postgres:18
+  command: ["postgres", "-c", "max_prepared_transactions=200"]
+  environment:
+    POSTGRES_USER: ledger
+    POSTGRES_DB: ledger
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ledger-dev}
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
+    interval: 2s
+    timeout: 3s
+    retries: 30
+
 # Shared settings for every service built from deploy/Dockerfile.
 x-app: &app
   image: payment-ledger:dev
@@ -8,26 +23,34 @@ x-app: &app
     dockerfile: deploy/Dockerfile
   environment: &app-env
     DATABASE_URL: postgres://ledger:${POSTGRES_PASSWORD:-ledger-dev}@postgres:5432/ledger?sslmode=disable
+    # Rung 4: comma-separated shard URLs, shard 0 first. One URL = unsharded.
+    SHARD_URLS: ${SHARD_URLS:-postgres://ledger:${POSTGRES_PASSWORD:-ledger-dev}@postgres:5432/ledger?sslmode=disable}
+    CROSS_SHARD: ${CROSS_SHARD:-2pc}
   depends_on:
     postgres:
       condition: service_healthy
 
 services:
-  postgres:
-    image: postgres:18
-    environment:
-      POSTGRES_USER: ledger
-      POSTGRES_DB: ledger
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ledger-dev}
+  postgres: # shard 0, always on
+    <<: *pg
     ports:
       - "55432:5432"
     volumes:
       - pgdata:/var/lib/postgresql
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ledger -d ledger"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
+
+  postgres-shard1: # shard 1, Rung 4 only
+    <<: *pg
+    profiles: ["shards"]
+    ports:
+      - "55433:5432"
+    volumes:
+      - pgdata1:/var/lib/postgresql
+
+  toxiproxy: # network faults between app and shards (Rung 4)
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    profiles: ["faults"]
+    ports:
+      - "8474:8474"
 
   migrate:
     <<: *app
@@ -68,6 +91,7 @@ services:
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
       CAS_ATTEMPTS: ${CAS_ATTEMPTS:-10}
       FAILPOINTS: ${FAILPOINTS:-}
+      PREPARE_TIMEOUT: ${PREPARE_TIMEOUT:-2s}
 
   k6:
     image: grafana/k6:2.3.0
@@ -82,3 +106,4 @@ services:
 
 volumes:
   pgdata: {}
+  pgdata1: {}

@@ -33,7 +33,7 @@ func (l *Ledger) PlaceHold(ctx context.Context, r AcceptRequest) (store.Transfer
 	if err != nil {
 		return store.Transfer{}, store.Hold{}, err
 	}
-	h, err := store.GetHoldByTransfer(ctx, l.db, t.ID)
+	h, err := store.GetHoldByTransfer(ctx, l.shards.For(t.ID), t.ID)
 	return t, h, err
 }
 
@@ -43,17 +43,27 @@ func (l *Ledger) PlaceHold(ctx context.Context, r AcceptRequest) (store.Transfer
 func (l *Ledger) CaptureHold(ctx context.Context, key string, hash []byte, holdID uuid.UUID, amount *int64) (store.Transfer, store.Hold, error) {
 	var t store.Transfer
 	var h store.Hold
-	err := l.runCAS(ctx, "capture_hold", func(tx pgx.Tx) error {
-		var err error
+	err := l.runX(ctx, "capture_hold", func(x *store.XTx) error {
+		tx, err := x.For(holdID)
+		if err != nil {
+			return err
+		}
 		if h, err = l.lockManualHold(ctx, tx, holdID); err != nil {
 			return err
 		}
-		_, claimed, err := store.ClaimIdempotencyKey(ctx, tx, key, hash, h.TransferID)
+		// Named before the key claim, so a replay spanning two shards
+		// commits too (A§9.2).
+		x.SetHome(h.TransferID)
+		ktx, err := x.On(l.keyShard(key))
+		if err != nil {
+			return err
+		}
+		_, claimed, err := store.ClaimIdempotencyKey(ctx, ktx, key, hash, h.TransferID)
 		if err != nil {
 			return err
 		}
 		if claimed {
-			if err := l.capture(ctx, tx, h, amount); err != nil {
+			if err := l.capture(ctx, x, tx, h, amount); err != nil {
 				return err
 			}
 			if h, err = store.GetHoldByTransfer(ctx, tx, h.TransferID); err != nil {
@@ -66,7 +76,9 @@ func (l *Ledger) CaptureHold(ctx context.Context, key string, hash []byte, holdI
 	return t, h, err
 }
 
-func (l *Ledger) capture(ctx context.Context, tx pgx.Tx, h store.Hold, amount *int64) error {
+// capture posts a manual Hold. tx is the Hold's shard; the posting itself
+// may touch the destination's shard through x.
+func (l *Ledger) capture(ctx context.Context, x *store.XTx, tx pgx.Tx, h store.Hold, amount *int64) error {
 	if h.Status != "active" {
 		return &HoldNotActiveError{Status: h.Status}
 	}
@@ -84,7 +96,7 @@ func (l *Ledger) capture(ctx context.Context, tx pgx.Tx, h store.Hold, amount *i
 	if !captured {
 		return expiredError(h)
 	}
-	if err := post(ctx, tx, h.TransferID, h.SourceID, h.DestID, amt); err != nil {
+	if err := post(ctx, x, h.TransferID, h.SourceID, h.DestID, amt); err != nil {
 		return err
 	}
 	return store.SetTransferStatus(ctx, tx, h.TransferID, "posted")
@@ -95,12 +107,22 @@ func (l *Ledger) capture(ctx context.Context, tx pgx.Tx, h store.Hold, amount *i
 // the current Hold.
 func (l *Ledger) ReleaseHold(ctx context.Context, key string, hash []byte, holdID uuid.UUID) (store.Hold, error) {
 	var h store.Hold
-	err := l.runCAS(ctx, "release", func(tx pgx.Tx) error {
-		var err error
+	err := l.runX(ctx, "release", func(x *store.XTx) error {
+		tx, err := x.For(holdID)
+		if err != nil {
+			return err
+		}
 		if h, err = l.lockManualHold(ctx, tx, holdID); err != nil {
 			return err
 		}
-		_, claimed, err := store.ClaimIdempotencyKey(ctx, tx, key, hash, h.TransferID)
+		// Named before the key claim, so a replay spanning two shards
+		// commits too (A§9.2).
+		x.SetHome(h.TransferID)
+		ktx, err := x.On(l.keyShard(key))
+		if err != nil {
+			return err
+		}
+		_, claimed, err := store.ClaimIdempotencyKey(ctx, ktx, key, hash, h.TransferID)
 		if err != nil || !claimed {
 			return err
 		}

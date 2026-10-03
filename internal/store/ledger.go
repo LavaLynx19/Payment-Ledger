@@ -9,6 +9,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"payment-ledger/internal/shard"
 )
 
 // Querier is satisfied by both *pgxpool.Pool and pgx.Tx.
@@ -129,7 +131,7 @@ func InsertPendingTransfer(ctx context.Context, tx pgx.Tx, t Transfer, holdTTL t
 		return Transfer{}, fmt.Errorf("insert transfer: %w", err)
 	}
 
-	holdID, err := uuid.NewV7()
+	holdID, err := shard.Like(t.SourceID)
 	if err != nil {
 		return Transfer{}, err
 	}
@@ -228,7 +230,7 @@ func InsertEntries(ctx context.Context, tx pgx.Tx, es []Entry) error {
 	dirs := make([]string, n)
 	amounts, balances, versions := make([]int64, n), make([]int64, n), make([]int64, n)
 	for i, e := range es {
-		id, err := uuid.NewV7()
+		id, err := shard.Like(e.AccountID)
 		if err != nil {
 			return err
 		}

@@ -29,7 +29,7 @@ func (s *Service) CreateTransfer(ctx context.Context, req *connect.Request[ledge
 	if err != nil {
 		return nil, err
 	}
-	t, err := s.ledger.CreateTransfer(ctx, ledger.AcceptRequest{
+	t, err := s.engine.CreateTransfer(ctx, ledger.AcceptRequest{
 		Key: key, Hash: hash, SourceID: src, DestID: dst, Amount: req.Msg.GetAmount(), HoldTTL: ttl,
 	})
 	if err != nil {
@@ -47,7 +47,7 @@ func (s *Service) TopUp(ctx context.Context, req *connect.Request[ledgerv1.TopUp
 	if err != nil {
 		return nil, err
 	}
-	t, err := s.ledger.TopUp(ctx, key, hash, wallet, req.Msg.GetAmount())
+	t, err := s.engine.TopUp(ctx, key, hash, wallet, req.Msg.GetAmount())
 	if err != nil {
 		return nil, toConnect(err)
 	}
@@ -63,7 +63,7 @@ func (s *Service) Withdraw(ctx context.Context, req *connect.Request[ledgerv1.Wi
 	if err != nil {
 		return nil, err
 	}
-	t, err := s.ledger.Withdraw(ctx, key, hash, wallet, req.Msg.GetAmount())
+	t, err := s.engine.Withdraw(ctx, key, hash, wallet, req.Msg.GetAmount())
 	if err != nil {
 		return nil, toConnect(err)
 	}
@@ -79,7 +79,7 @@ func (s *Service) ReverseTransfer(ctx context.Context, req *connect.Request[ledg
 	if err != nil {
 		return nil, err
 	}
-	reversal, receivable, err := s.ledger.ReverseTransfer(ctx, key, hash, id)
+	reversal, receivable, err := s.engine.ReverseTransfer(ctx, key, hash, id)
 	if err != nil {
 		return nil, toConnect(err)
 	}
@@ -102,7 +102,7 @@ func (s *Service) Repay(ctx context.Context, req *connect.Request[ledgerv1.Repay
 	if err != nil {
 		return nil, err
 	}
-	t, err := s.ledger.Repay(ctx, key, hash, wallet, req.Msg.GetAmount())
+	t, err := s.engine.Repay(ctx, key, hash, wallet, req.Msg.GetAmount())
 	if err != nil {
 		return nil, toConnect(err)
 	}
@@ -114,7 +114,7 @@ func (s *Service) GetTransfer(ctx context.Context, req *connect.Request[ledgerv1
 	if err != nil {
 		return nil, err
 	}
-	t, err := s.ledger.GetTransfer(ctx, id)
+	t, err := s.engine.GetTransfer(ctx, id)
 	if err != nil {
 		return nil, toConnect(err)
 	}
@@ -126,7 +126,7 @@ func (s *Service) GetBalance(ctx context.Context, req *connect.Request[ledgerv1.
 	if err != nil {
 		return nil, err
 	}
-	b, err := s.ledger.GetBalance(ctx, id)
+	b, err := s.engine.GetBalance(ctx, id)
 	if err != nil {
 		return nil, toConnect(err)
 	}
@@ -154,7 +154,7 @@ func (s *Service) PlaceHold(ctx context.Context, req *connect.Request[ledgerv1.P
 	if err != nil {
 		return nil, err
 	}
-	t, h, err := s.ledger.PlaceHold(ctx, ledger.AcceptRequest{
+	t, h, err := s.engine.PlaceHold(ctx, ledger.AcceptRequest{
 		Key: key, Hash: hash, SourceID: src, DestID: dst, Amount: req.Msg.GetAmount(), HoldTTL: ttl,
 	})
 	if err != nil {
@@ -172,7 +172,7 @@ func (s *Service) CaptureHold(ctx context.Context, req *connect.Request[ledgerv1
 	if err != nil {
 		return nil, err
 	}
-	t, h, err := s.ledger.CaptureHold(ctx, key, hash, holdID, req.Msg.Amount)
+	t, h, err := s.engine.CaptureHold(ctx, key, hash, holdID, req.Msg.Amount)
 	if err != nil {
 		return nil, toConnect(err)
 	}
@@ -188,7 +188,7 @@ func (s *Service) ReleaseHold(ctx context.Context, req *connect.Request[ledgerv1
 	if err != nil {
 		return nil, err
 	}
-	h, err := s.ledger.ReleaseHold(ctx, key, hash, holdID)
+	h, err := s.engine.ReleaseHold(ctx, key, hash, holdID)
 	if err != nil {
 		return nil, toConnect(err)
 	}

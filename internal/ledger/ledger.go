@@ -9,10 +9,10 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"payment-ledger/internal/failpoint"
+	"payment-ledger/internal/shard"
 	"payment-ledger/internal/store"
 )
 
@@ -35,29 +35,59 @@ type Config struct {
 	KeyRetention time.Duration  // how long idempotency keys are kept (A§2.7: 24h)
 	Failpoints   *failpoint.Set // Rung 2 crash points; nil disables all
 	CASStats     store.Counter  // per-op CAS attempts/conflicts/exhausted; nil disables
+	// PrepareTimeout is how long a 2PC may sit prepared with no decision
+	// before the resolver aborts it (A§9.4).
+	PrepareTimeout time.Duration
+	// CrossShard is how capture posts a credit on another shard: CrossShard2PC
+	// (default) or CrossShardSaga (A§9.5).
+	CrossShard string
 }
 
-// runCAS runs fn as one CAS tx with retries, counting outcomes under op.
-func (l *Ledger) runCAS(ctx context.Context, op string, fn func(pgx.Tx) error) error {
-	return store.RunCAS(ctx, l.db, l.cfg.CASAttempts, l.cfg.CASStats, op, fn)
+const (
+	CrossShard2PC  = "2pc"
+	CrossShardSaga = "saga"
+)
+
+// Resolve finishes in-doubt 2PC writes on every shard (A§9.4).
+func (l *Ledger) Resolve(ctx context.Context) (committed, rolledBack int, err error) {
+	return l.shards.Resolve(ctx, l.cfg.PrepareTimeout, l.cfg.CASStats)
+}
+
+// runX runs fn as one cross-shard write (A§9.2) with retries, counting CAS
+// outcomes under op. A write that touches one shard commits locally.
+func (l *Ledger) runX(ctx context.Context, op string, fn func(*store.XTx) error) error {
+	return l.shards.RunX(ctx, l.cfg.CASAttempts, l.cfg.CASStats, op, l.fail, fn)
 }
 
 type Ledger struct {
-	db        *pgxpool.Pool
-	cfg       Config
-	fundingID uuid.UUID
+	shards     *store.Shards
+	db         *pgxpool.Pool // shard 0, for single-shard helpers and tests
+	cfg        Config
+	fundingIDs []uuid.UUID // per shard: TopUp/Withdraw use the Wallet's own shard's (A§9.1)
 }
 
-func New(ctx context.Context, db *pgxpool.Pool, cfg Config) (*Ledger, error) {
-	fundingID, err := store.FundingAccountID(ctx, db)
-	if errors.Is(err, store.ErrAccountNotFound) {
-		return nil, errors.New("funding account missing; run cmd/seed first")
+func New(ctx context.Context, shards *store.Shards, cfg Config) (*Ledger, error) {
+	l := &Ledger{shards: shards, db: shards.Pool(0), cfg: cfg}
+	for i := range shards.N() {
+		id, err := store.FundingAccountID(ctx, shards.Pool(i))
+		if errors.Is(err, store.ErrAccountNotFound) {
+			return nil, fmt.Errorf("shard %d: funding account missing; run cmd/seed first", i)
+		}
+		if err != nil {
+			return nil, err
+		}
+		l.fundingIDs = append(l.fundingIDs, id)
 	}
-	if err != nil {
-		return nil, err
-	}
-	return &Ledger{db: db, cfg: cfg, fundingID: fundingID}, nil
+	return l, nil
 }
+
+// fundingFor is the funding account on wallet's shard.
+func (l *Ledger) fundingFor(wallet uuid.UUID) uuid.UUID {
+	return l.fundingIDs[l.shardOf(wallet)]
+}
+
+// keyShard is the shard an Idempotency-Key lives on (A§9.2).
+func (l *Ledger) keyShard(key string) int { return shard.ForKey(key, l.shards.N()) }
 
 // Domain errors. internal/api maps each one to its A§7 reason.
 
@@ -88,8 +118,8 @@ var (
 
 func invalid(msg string) error { return &InvalidError{Msg: msg} }
 
-func (l *Ledger) account(ctx context.Context, tx pgx.Tx, id uuid.UUID) (store.Account, error) {
-	a, err := store.GetAccount(ctx, tx, id)
+func (l *Ledger) account(ctx context.Context, q store.Querier, id uuid.UUID) (store.Account, error) {
+	a, err := store.GetAccount(ctx, q, id)
 	if errors.Is(err, store.ErrAccountNotFound) {
 		return store.Account{}, &NotFoundError{Resource: "account", ID: id.String()}
 	}

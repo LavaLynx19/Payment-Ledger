@@ -223,6 +223,7 @@ idempotency_keys(
 5. Every posted Transfer has exactly one captured Hold, and its Entries post exactly the Hold's `captured_amount`. `transfers.amount` stays the requested amount. No Hold is both captured and expired.
 6. Every idempotency key maps to exactly one Transfer.
 7. A reversed Transfer has at most one reversal and one receivable Transfer, and their amounts sum to its posted amount. A receivable System account never goes below zero, now or in its history, so no Receivable is ever overpaid.
+8. (Rung 4) Every reference that can cross shards resolves on the shard its id routes to: `transfers.dest_id`, `holds.dest_id`, `entries.transfer_id`, `transfers.reverses_id`, `idempotency_keys.transfer_id`. No 2PC is left in doubt: no prepared tx remains once the ledger is idle.
 
 ## 5. Write paths
 
@@ -355,6 +356,132 @@ Package `ledger.v1`, service `LedgerService`. It's served as gRPC and as Connect
 
 TPS targets are multiples of the Rung 1 baseline (see README), recorded in each Rung retro.
 
+## 9. Rung 4: sharding and the TigerBeetle comparison
+
+Decided in P5.1. This section describes the Rung 4 design. §4-§6 stay authoritative for single-shard behavior.
+
+### 9.1 Placement and routing
+- **2 Postgres shards**, each a separate instance with the full §4 schema. On 2 shards, about 50% of random P2P pairs cross shards.
+- **Shard bits inside UUIDv7.** The top 4 bits of `rand_a` (right after the version nibble) carry the shard number, which allows up to 16 shards and leaves time ordering untouched. `shard(id)` is a pure function of the id, so every process, the checker and the harness route without a lookup. Every id is minted with its shard bits:
+  - **Wallets**: round-robin at creation.
+  - **Funding**: one funding System account **per shard**, so TopUp and Withdraw are always single-shard.
+  - **Receivable**: minted with **its debtor's shard bits**, so the Receivable rules stay single-shard.
+  - **Transfer and Hold**: the source Account's shard.
+  - **Entry**: its Account's shard.
+- **Idempotency keys** live on shard `hash(key) mod N`. The key namespace stays global and mismatch detection exact (Decision Log → *Sharded idempotency keys join the 2PC*).
+- **Non-goal: resharding.** N is fixed when ids are minted. A later deployment-scale experiment may revisit it.
+
+### 9.2 Cross-shard writes: one generic transaction object
+Every write path runs through a **cross-shard transaction** (`store.XTx`). It lazily begins a tx on each shard the path touches. On commit:
+- **One shard touched:** a plain local commit. That's all single-shard behavior, unchanged.
+- **Two or more:** 2PC. `PREPARE TRANSACTION` on each participant in shard order, then the decision row, then `COMMIT PREPARED` on each, then delete the decision (§9.4).
+
+The **decision lives on the operation's home shard**: the shard of the Transfer the operation creates or changes. The gid embeds that Transfer's id, so the resolver finds the decision from the gid alone. Version conflicts retry the whole object, like `RunCAS`.
+
+| Path | Participants | Home |
+|---|---|---|
+| CreateTransfer, PlaceHold, TopUp, Withdraw, Repay | key shard K = FNV-1a(key) mod N; source shard S | S |
+| ReleaseHold | K; the Hold's shard | the Hold's shard |
+| CaptureHold, Capture | K (CaptureHold only); source shard; destination shard | source shard |
+| ReverseTransfer | K; payer shard (the original Transfer is locked there); recipient shard (new Transfers and the receivable) | recipient shard |
+
+- **TopUp and Withdraw** use the funding account **on the Wallet's own shard**, so with K = S they stay local.
+- **An in-flight duplicate** blocks on K's unique index until the original commits or rolls back, then replays.
+- **Destination reads:** on another shard, the destination's existence and kind are read **outside** the tx from its own shard. Accounts are never deleted, so that read can't go stale.
+- **Foreign keys that can cross shards are dropped**, and the cross-shard checker verifies those references instead (§9.6):
+  - `idempotency_keys.transfer_id` (migration 00004): key and Transfer live on different shards.
+  - `transfers.dest_id` and `holds.dest_id` (migration 00005): the destination can be on another shard.
+  - `entries.transfer_id` (00005): a credit Entry lives on the destination's shard, while its Transfer is on the source's.
+  - `transfers.reverses_id` (00005): a reversal lives on the recipient's shard, while the original is on the payer's.
+
+  References that are always local keep their FKs: `source_id`, `entries.account_id`, a Hold's `transfer_id`, and a receivable's `debtor_wallet_id`.
+- **Distributed deadlock:** each shard only sees its own waits, so a cycle that spans shards can't be detected by Postgres. Multi-shard sessions run with `lock_timeout = 5s`, and a timeout is treated as a conflict and retried.
+- **Connection pools are a resource too.** An XTx holds one shard's connection while it waits for the next, so with every pool full, transfers on shard 0 can wait for shard 1 while those on shard 1 wait for shard 0. Postgres never sees that cycle. Admission control prevents it: with more than one shard, a per-process semaphore admits at most `pool_max_conns − 1` XTx at a time, the cap being the smallest pool. An XTx holds at most one transaction per shard, so a waiter can always get a connection, and the spare connection serves reads made outside the tx (destination checks, the resolver). An XTx queues on the semaphore before it holds anything.
+
+### 9.3 Capture: 2PC by default
+A Hold's debit lives on its source shard S and its credit on the destination's shard D. The worker claims batches **per source shard** (`FOR UPDATE SKIP LOCKED` on S, as §5), and posts each claimed batch as **one cross-shard write** (§9.2):
+- **Participants:** S plus every destination shard the batch credits. A batch with only local destinations commits locally, exactly as §5. A batch with mixed destinations commits all of its Holds atomically in one 2PC. With 2 shards that's at most S → D.
+- **Steps on S:** claim, mark captured, post the debits (`ApplyNet`), insert the debit Entries, set the Transfers to `posted`.
+- **Steps on each D:** post the credits and insert the credit Entries. Accounts are posted in ascending id order, which is a global order because the shard bits sit below the timestamp.
+- **Home:** the batch's first Transfer, on S. The gid is `x-<that id>`, and S holds the decision (§9.4).
+- **Batching by destination shard was considered and rejected.** One write per claimed batch keeps the FIFO claim simple and nets each hot Account once per batch. The cost, with more than 2 shards, is more 2PC participants per mixed batch instead of more batches.
+
+**Nothing bends:** debit and credit become visible atomically. The recipient was already credited asynchronously by capture on a single shard, so the sender's strict read-your-writes and never-negative are unchanged.
+
+### 9.4 2PC recovery (decision log + resolver)
+- **Each shard has a `decisions (gid PK, outcome, decided_at)` table.** `outcome` is `commit` or `abort`. The row on the write's home shard **arbitrates** the outcome. Both sides insert with `ON CONFLICT DO NOTHING`, and whichever row lands first decides:
+  - **Coordinator:** after preparing every participant, it inserts `commit`. If an `abort` is already there, the resolver got in first: the coordinator rolls back its prepared txs and retries the whole write, and nothing was committed.
+  - **Resolver** (a worker loop, every `RESOLVE_INTERVAL`, default 1s): it scans `pg_prepared_xacts` on every shard. For each gid it finds the home shard from the gid and reads the decision:
+    - `commit`: `COMMIT PREPARED` on that shard.
+    - `abort`, or none while the prepared tx is older than `PREPARE_TIMEOUT` (default 2s): it inserts `abort` (`ON CONFLICT DO NOTHING`), re-reads the outcome, and rolls back unless the row it reads says `commit`.
+  - **Why:** presumed abort alone is unsafe. A slow but live coordinator could write `commit` after the resolver rolled back, leaving a split outcome. Arbitrating on the primary key makes the two outcomes mutually exclusive.
+- **From the first PREPARE on, the request's context no longer governs.** The PREPAREs, recording the decision, phase 2 and the abort path run on `context.WithoutCancel` with their own 2s timeout (`PREPARE_TIMEOUT`'s default). A client deadline therefore can't strand a prepared tx, which would keep its locks until the resolver rolled it back. Crashes still leave prepared txs; the resolver handles those.
+- **Cleanup:** the coordinator deletes its `commit` row after phase 2. The resolver deletes decisions older than `PREPARE_TIMEOUT` whose gid is no longer prepared on any shard.
+- **Failpoints** for the Rung 2 matrix: `twopc.after_first_prepare`, `twopc.after_all_prepared`, `twopc.after_decision`, `twopc.after_first_commit`.
+- **Counters** in the `cas` expvar map: `twopc.commits`, `twopc.aborts`, `resolve.committed`, `resolve.rolled_back`.
+- Postgres needs `max_prepared_transactions` > 0 (P5.2).
+
+### 9.5 Saga variant (comparison only, `CROSS_SHARD=saga`)
+**Scope:** only the worker's **capture posting** switches. Key placement (Accept, Release, CaptureHold) and the Reversal lock stay on 2PC in both modes, because they need atomicity for exactly-once guarantees, not just for balance. So the comparison is "posting via 2PC vs via saga". Manual CaptureHold also keeps 2PC.
+
+- **Leg 1, on S:** the capture batch posts every debit, posts the credits whose destination is also on S, and writes an `outbox (transfer_id PK, dest_id, amount)` row for each credit whose destination lives on another shard. All in one **local** tx, with no 2PC. The Transfer becomes `posted` here, when its debit lands.
+- **Leg 2, on D:** a relay (a worker loop) claims outbox rows on S (`FOR UPDATE SKIP LOCKED`) and, per destination shard, applies the credits in one local tx through the same netted posting as §5. It skips any Transfer already credited there, with a unique `(transfer_id, direction)` on Entries as the backstop. Only then does it delete the claimed outbox rows on S. A crash between the two (failpoint `saga.after_credit`) leaves the outbox row, and the next relay finds the credit already applied and just deletes it. Each credit is applied exactly once.
+- **Relaxations, documented and measured:** the recipient is credited after the sender is debited, and the ledger is globally unbalanced by the outbox total while legs are in flight.
+  - The **checker** counts outbox rows as in-flight credits: a Transfer with an outbox row is expected to net its amount, and the ledger to net Σ outbox.
+  - The **harness drain** waits for the outbox to empty, so post-drain checks are strict.
+- **Counters:** `saga.outbox_written`, `saga.relayed`, `saga.already_applied`. The default stays 2PC.
+
+### 9.6 Reads and the checker
+- **Routing:** GetTransfer, GetBalance and GetBalanceAt route by id. ListEntries routes by account. ListReceivables fans out to every shard and merges by debtor id.
+- **Checker:** two kinds of check.
+  - **Local:** SQL run on each shard. Invariants 2, 3 and 4; invariant 5's Hold half; receivables-never-overpaid from 7; and invariant 8's "no prepared tx".
+  - **Global:** checks whose rows span shards. The ledger and per-Transfer balance (1), "posted ⇔ has Entries" (5), keys → Transfers (6), reversal totals (7), and every cross-shard reference (8). These are computed in Go from a compact projection read off every shard.
+
+  Each shard is read in its own read-only REPEATABLE READ snapshot. Together they're consistent only while the ledger is idle, so the checker runs after the drain, as the harness already does. With one shard, every check means exactly what it did before.
+
+### 9.7 TigerBeetle backend (`LEDGER_ENGINE=tigerbeetle`)
+The same API runs on a single-replica TigerBeetle, which isn't sharded: the comparison is **sharded Postgres vs one TigerBeetle**. It has full API parity using native mechanisms only, with the two gaps proven atomic by `prototypes/tb-gaps` (Decision Log → *TigerBeetle gaps close with linked chains*).
+
+| Ledger rule | TigerBeetle mechanism |
+|---|---|
+| Hold / Capture (partial, remainder restored) / Release | `pending` / `post_pending_transfer` / `void_pending_transfer` |
+| Expiry, never-expiring system Holds | `timeout` in **whole seconds**, so TTLs round up. `timeout = 0` meaning "never expires" is verified in P5.3 |
+| Wallet never negative (Available) | `debits_must_not_exceed_credits` (pending debits included) |
+| Idempotency | Transfer id = a deterministic 128-bit hash of the Idempotency-Key. A mismatch shows as `exists_with_different_*` |
+| No overpaid Receivable | `credits_must_not_exceed_debits` on the receivable account |
+| Open Receivable blocks debits | Each non-repayment Wallet debit is linked to a `balancing_credit` from a zero-balance control account into the debtor's receivable. The chain fails if anything is owed |
+| Reversal shortfall | Linked chain via a control account: C→A X, B→C `balancing_debit` X (moves r), R→C `balancing_credit` X (moves X − r) |
+| Point-in-time balance, statements | `history` flag + `get_account_balances`, `get_account_transfers` |
+| Receivables list | Query the receivable accounts and filter owed > 0 in the app |
+
+**Posting model (P5.10 decision): single-phase where possible.**
+- **Posted at once:** CreateTransfer, TopUp, Withdraw, Repay and Reversal post as **one atomic TigerBeetle transfer**, with limits enforced in the engine. The API returns `POSTED`, and there's no capture worker or backlog.
+- **Two-phase only for Holds:** PlaceHold, CaptureHold and ReleaseHold use `pending` / `post_pending_transfer` / `void_pending_transfer`.
+- **Idempotency is the transfer id:** a deterministic 128-bit hash of the Idempotency-Key. Same fields replay; different fields come back as `exists_with_different_*` and map to `IDEMPOTENCY_MISMATCH`. Keys never expire, where Postgres keeps them 24h.
+- **Capture and Release use ids derived from the Hold id,** so TigerBeetle can tell a Hold's status without its own store. **Parity limit:** capturing or releasing an already-settled Hold with a *new* key returns its current state, where Postgres returns `HOLD_NOT_ACTIVE`. This is recorded as a finding.
+- **Build:** the engine compiles only with `-tags tigerbeetle`. A `tigerbeetle` Dockerfile target (cgo, `gcr.io/distroless/base-debian13` to match the build image's glibc 2.41) produces `payment-ledger:tb`, and the TigerBeetle overlay uses it. The default image stays static.
+
+**Constraints found by the prototype:**
+- The Go client's macOS native library fails to link, so TigerBeetle code builds and tests **only in Linux containers**.
+- The client needs **io_uring**, so its containers need `seccomp=unconfined`, the same as the server.
+- The data file needs a **Docker named volume**, because a macOS bind mount refuses its preallocation.
+- Client 0.17.9 is pinned to server image 0.17.9.
+- The client accepts only an IP (or a bare port), not a hostname, so the engine resolves Compose service names itself (P5.10).
+
+**Parity findings (P5.10):**
+- **Failed ids are permanent.** TigerBeetle remembers a transfer id that failed for a transient reason (e.g. `exceeds_credits`) and answers a later retry with `id_already_failed`. Because the id derives from the Idempotency-Key, a client that retries the same key after topping up can never succeed and must use a new key. The engine reports it as `INVALID_REQUEST`. In Postgres a rejected Accept rolls back its key, so a later retry can succeed.
+- **Settling a Hold twice:** see the capture/release note above.
+
+**Receivable rules (P5.11), native chains from `prototypes/tb-gaps`:**
+- **Each Wallet is created with its receivable account** (code receivable, `credits_must_not_exceed_debits`, `user_data_128` = debtor), so the guard below always has a target.
+- **Guarded debits.** Every Wallet debit except a Repayment (P2P, Withdraw, PlaceHold) is linked with a `balancing_credit` from a zero-balance control account D into the debtor's receivable. The chain fails when anything is owed, which maps to `RECEIVABLE_OPEN`.
+- **Repay** credits the receivable, and an overpayment is refused by TigerBeetle itself.
+- **ReverseTransfer** is one linked chain through a control account C: C→payer X; recipient→C `balancing_debit` X (moves r); receivable→C `balancing_credit` X (moves X − r). C nets to zero after every reversal, so one shared C works. The engine presents the result as Postgres does: a reversal (recipient → payer, r) and a receivable (receivable → payer, X − r), with `reverses_id` stored in `user_data_128`. **Parity limit:** the chain's ids derive from the original Transfer, so TigerBeetle enforces "reverse at most once" itself, but a second reversal with a new key replays the first, where Postgres returns `TRANSFER_NOT_REVERSIBLE`.
+- **ListReceivables** queries receivable accounts and keeps those owing. `opened_at` is when the current run of non-zero balance began, from the account's balance history.
+
+### 9.8 Rung 4 measurements (P5.4)
+The Rung 1 baseline, Rung 3 hot runs and Rung 2 fault matrix are run on: sharded Postgres with 2PC, sharded Postgres with the saga, and TigerBeetle. Results are reported as ratios, since everything shares one machine. Cross-shard share and 2PC counts come from new expvar counters (`twopc.*`, `saga.*`).
+
 ## Decision Log
 
 ### Hand-built Postgres ledger before TigerBeetle
@@ -378,5 +505,27 @@ Rung 2's scenario mixes P2P with Holds and reversals, and it deliberately crashe
 ### Rung 3: version checks only where a funds check needs them
 P4.1 showed optimistic CAS everywhere turning hot Accounts into retry storms. With 80% of P2P going to one merchant, 51% of capture attempts conflicted (2,979 exhausted) and posted/s fell to 1,403. With 20% TopUps, 40% of accepts conflicted on the funding row and p99 hit 17 ms. A version check only earns its cost where it guards a funds check, which is Accept on a Wallet source. So capture posts with an atomic `posted ± x` under the row lock, and Accept no longer bumps System-account sources. The plan is staged by measurement: (1) these two changes; (2) batch captures per hot Account, bumping the version by n so each Entry keeps a consecutive version and its own `balance_after`, only if stage 1 misses the target; (3) sub-accounts for hot keys only if a batched single row still can't keep up, deciding then which Accounts may be split.
 
+### Rung 4: 2PC by default, the saga as a measured variant
+The user chose "nothing bends" for cross-shard Transfers, which only 2PC delivers: debit and credit commit atomically. A saga necessarily credits the recipient late and leaves the ledger unbalanced while legs are in flight. It's built anyway, behind `CROSS_SHARD=saga`, so its cost and relaxations can be measured against 2PC. 2PC's failure mode (prepared txs holding locks after a coordinator crash) is covered by a decision log plus a presumed-abort resolver.
+
+### Shard bits inside UUIDv7
+Each id carries its shard in the top 4 bits of `rand_a`, so routing is a pure function of the id. That gives co-location without a lookup service: a receivable takes its debtor's bits, and each shard has its own funding account. The cost is that N can't change without rewriting ids, so resharding is an explicit non-goal for Rung 4. A directory table was rejected (a lookup path and a single point of failure), and so was `hash(id)` plus special cases (System accounts scatter, and a new N reshuffles everything).
+
+### Sharded idempotency keys join the 2PC
+Keys live on shard `hash(key)`, not on the source account's shard. That keeps one global key namespace with exact `IDEMPOTENCY_MISMATCH` detection: a key reused for a different-shard source is still caught. The cost is a 2PC in Accept whenever the key's shard and the source shard differ (about 50% at 2 shards). Storing the key with the source would keep Accept single-shard but silently create a second Transfer on cross-shard key reuse.
+
+### TigerBeetle gaps close with linked chains
+Question: can the two rules without a native TigerBeetle flag be enforced atomically, or would app-side checks race (Rung 1 again)? Prototype `prototypes/tb-gaps` passed 21/21 checks against a real single-replica TigerBeetle 0.17.9.
+1. **Open Receivable blocks debits:** link the debit with a `balancing_credit` from a zero-balance control account (`debits_must_not_exceed_credits`) into the receivable. It moves exactly what's owed, so the chain fails when anything is owed and is untouched otherwise.
+2. **Reversal shortfall:** C→A X, B→C `balancing_debit` X, R→C `balancing_credit` X, linked. That returns r = min(X, B's available) and records the X − r shortfall in one atomic chain. Zero-amount balancing results are accepted.
+
+Verdict: TigerBeetle parity uses native mechanisms only, with no app-side races.
+
 ### System-initiated Holds never expire
 Every other Hold expires, but Reversal and receivable Holds have no expiry. If the worker is down or slow, a correction must not silently fail and leave a mistaken Transfer uncorrected. The cost is that the debtor's funds stay held until the worker recovers.
+
+### 2PC admission cap instead of ordered acquisition
+P5.12's first two-shard run collapsed from 2,000 to 121 ops/s with p99 pinned at the 5s request deadline. Postgres logged no lock timeouts. The cause was a deadlock between the two connection pools: XTx opens shards lazily, so a transfer holding a shard-0 connection waits for shard 1 while another does the reverse. Pool size moved the threshold (4 connections collapsed at once, 64 ran clean), which confirmed it. We cap concurrent XTx below the pool size instead of acquiring shards in a fixed order. The cap needs no change to the XTx API or its call sites, and it rules out the deadlock by construction. The cost is that cross-shard concurrency is bounded by `pool_max_conns`. A short acquire timeout with retry was rejected: it breaks deadlocks after the fact and wastes work under load. The same runs showed client deadlines cancelling the 2PC after PREPARE, so everything after PREPARE now ignores the request's cancellation (§9.4).
+
+### 2PC prepare timeout: 2s, not 10s
+P5.12's fault matrix kept every invariant but cost availability. A coordinator that crashes after PREPARE leaves row locks held until the resolver presumes abort. With a 10s timeout, transfers on those Wallets waited out the 5s `lock_timeout`, retried, and exhausted the client's 10s window: 238 give-ups in one `twopc.after_first_prepare` run, against 0 at Rung 2. At 2s the same run gave up 1, and throughput rose from 800 to 1,532 ops/s. A shorter timeout is safe because the decision row arbitrates (§9.4): a live coordinator that's merely slow finds the resolver's `abort` and retries, and nothing splits. The cost is wasted retries when a commit phase runs past 2s, which only happened beyond saturation. The coordinator's detached commit phase uses the same 2s bound.

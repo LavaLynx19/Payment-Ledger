@@ -24,6 +24,7 @@ Moving money between accounts sounds simple, but it breaks under concurrency, cr
 - End-user identity and login (see Constraints → Auth)
 - Multiple currencies or FX
 - Absolute throughput claims. Rungs prove correctness, and TPS numbers are relative.
+- Resharding. Rung 4 fixes the shard count when ids are minted. A later deployment-scale experiment may revisit this.
 
 ## User Stories
 

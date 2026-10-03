@@ -17,13 +17,13 @@ Go, connect-go over h2c, pgx v5 + pgxpool, goose, PostgreSQL via Docker Compose,
 - Placing a Hold bumps the source Account's version. A Reversal bumps the debtor Wallet's version.
 - Insert Entries after the CAS succeeds, with `created_at = clock_timestamp()` plus `balance_after` and `account_version`.
 - Available balance is always derived (posted − active unexpired Holds). A Hold with `expires_at IS NULL` never expires.
-- IDs are UUIDv7, generated in Go before insert.
+- IDs are UUIDv7, generated in Go before insert, always through `internal/shard` (`shard.NewID(s)` or `shard.Like(ref)`) so each id carries its shard (A§9.1). Use `Like` for anything that lives with another row: a Transfer or Hold with its source, an Entry with its Account, a receivable with its debtor.
 - Errors come from the A§7 table: Connect code + `reason` + human message. New reasons go into A§7 first.
 - Failpoints use the names in A§5 exactly. Each is a no-op unless its env var enables it.
 
 ## Database
 - Schema changes go in a new goose migration under `migrations/`. Applied migrations stay unchanged.
-- Tests that touch SQL run against the Compose Postgres. The invariant checker (`cmd/checker --once`) must be clean after every integration or harness run.
+- Tests that touch SQL run against the Compose Postgres. Two-shard tests run only when `SHARD_URLS` lists two shards (bring up `--profile shards`). They assert no 2PC leftovers **globally**, so run them one package at a time: `go test -p 1 ./...`. The invariant checker (`cmd/checker --once`) must be clean after every integration or harness run.
 
 ## Generated and ask-first files
 - `gen/` is buf output and is committed. Regenerate it with `go tool buf generate` after editing `proto/`. Codegen tools are pinned through go.mod's `tool` directive. k6 runs from its Docker image, and `go tool buf curl` is the smoke client.

@@ -1,10 +1,13 @@
-// Package checker verifies the A§4 ledger invariants with SQL. Every check
-// returns one row per violation, as human-readable detail.
+// Package checker verifies the A§4 ledger invariants across every shard
+// (A§9.6). Local checks are SQL run on each shard; global checks span shards
+// and are computed in Go from a compact projection of every shard. Each
+// check yields one human-readable detail per violation.
 package checker
 
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/jackc/pgx/v5"
 
@@ -14,19 +17,11 @@ import (
 type Check struct {
 	Invariant int
 	Name      string
-	SQL       string // SELECT detail text, one row per violation
+	SQL       string // local checks only: SELECT detail text, one row per violation
 }
 
-// Checks are the A§4 invariants 1-7.
-var Checks = []Check{
-	{1, "ledger balanced (Σ debits = Σ credits)", `
-		SELECT 'ledger off by ' || s FROM (
-			SELECT coalesce(sum(CASE WHEN direction = 'debit' THEN amount ELSE -amount END), 0) AS s FROM entries
-		) x WHERE s <> 0`},
-	{1, "each transfer balanced", `
-		SELECT 'transfer ' || transfer_id || ' off by ' || sum(CASE WHEN direction = 'debit' THEN amount ELSE -amount END)
-		FROM entries GROUP BY transfer_id
-		HAVING sum(CASE WHEN direction = 'debit' THEN amount ELSE -amount END) <> 0`},
+// Local are the invariants each shard can verify on its own.
+var Local = []Check{
 	{2, "posted matches entries and latest balance_after", `
 		WITH sums AS (
 			SELECT e.account_id, sum(CASE WHEN e.direction = a.normal_balance THEN e.amount ELSE -e.amount END) AS s
@@ -66,13 +61,11 @@ var Checks = []Check{
 		UNION ALL
 		SELECT 'account ' || e.account_id || ' entry version ' || e.account_version || ' > account version ' || a.version
 		FROM entries e JOIN accounts a ON a.id = e.account_id WHERE e.account_version > a.version`},
-	{5, "posted transfers have a captured hold and entries; others have neither", `
-		SELECT 'transfer ' || t.id || ' status=' || t.status || ' hold=' || coalesce(h.status, 'none') || ' entries=' || coalesce(e.n, 0)
-		FROM transfers t
-		LEFT JOIN holds h ON h.transfer_id = t.id
-		LEFT JOIN (SELECT transfer_id, count(*) AS n FROM entries GROUP BY transfer_id) e ON e.transfer_id = t.id
-		WHERE (t.status = 'posted') <> (h.status IS NOT DISTINCT FROM 'captured')
-		   OR (t.status = 'posted') <> (coalesce(e.n, 0) > 0)`},
+	// A Hold shares its Transfer's shard; so does the debit Entry (on the source).
+	{5, "posted transfers have a captured hold; others don't", `
+		SELECT 'transfer ' || t.id || ' status=' || t.status || ' hold=' || coalesce(h.status, 'none')
+		FROM transfers t LEFT JOIN holds h ON h.transfer_id = t.id
+		WHERE (t.status = 'posted') <> (h.status IS NOT DISTINCT FROM 'captured')`},
 	{5, "posted transfers post exactly the hold's captured amount", `
 		SELECT 'transfer ' || t.id || ' posted ' || coalesce(e.debits, 0)
 		       || ' but hold captured ' || coalesce(h.captured_amount::text, 'none')
@@ -83,21 +76,6 @@ var Checks = []Check{
 			FROM entries GROUP BY transfer_id
 		) e ON e.transfer_id = t.id
 		WHERE t.status = 'posted' AND coalesce(e.debits, 0) <> coalesce(h.captured_amount, -1)`},
-	// Several keys may name one Transfer (PlaceHold, then CaptureHold or ReleaseHold).
-	{6, "each idempotency key maps to an existing transfer", `
-		SELECT 'key ' || k.key || ' points at missing transfer ' || k.transfer_id
-		FROM idempotency_keys k LEFT JOIN transfers t ON t.id = k.transfer_id
-		WHERE t.id IS NULL`},
-	{7, "reversals return exactly the posted amount, once", `
-		SELECT 'transfer ' || o.id || ' posted ' || h.captured_amount || ' but reversals total '
-		       || sum(r.amount) || ' across ' || count(*) || ' transfers'
-		FROM transfers r
-		JOIN transfers o ON o.id = r.reverses_id
-		JOIN holds h ON h.transfer_id = o.id
-		GROUP BY o.id, h.captured_amount
-		HAVING sum(r.amount) <> h.captured_amount
-		    OR count(*) FILTER (WHERE r.type = 'reversal') > 1
-		    OR count(*) FILTER (WHERE r.type = 'receivable') > 1`},
 	{7, "receivables never overpaid", `
 		SELECT 'receivable account ' || a.id || ' posted=' || a.posted
 		FROM accounts a WHERE a.subtype = 'receivable' AND a.posted < 0
@@ -105,6 +83,9 @@ var Checks = []Check{
 		SELECT 'receivable account ' || e.account_id || ' went to ' || e.balance_after || ' at version ' || e.account_version
 		FROM entries e JOIN accounts a ON a.id = e.account_id
 		WHERE a.subtype = 'receivable' AND e.balance_after < 0`},
+	{8, "no 2PC left in doubt", `
+		SELECT 'prepared ' || gid || ' since ' || prepared
+		FROM pg_prepared_xacts WHERE database = current_database()`},
 }
 
 type Result struct {
@@ -115,37 +96,57 @@ type Result struct {
 
 const maxSamples = 5
 
-// Run executes every check on q. Pass a REPEATABLE READ tx (see Snapshot) so
-// all checks see one consistent state.
-func Run(ctx context.Context, q store.Querier) ([]Result, error) {
-	results := make([]Result, 0, len(Checks))
-	for _, c := range Checks {
-		rows, err := q.Query(ctx, c.SQL)
-		if err != nil {
-			return nil, fmt.Errorf("invariant %d (%s): %w", c.Invariant, c.Name, err)
+func (r *Result) add(detail string) {
+	r.Violations++
+	if len(r.Samples) < maxSamples {
+		r.Samples = append(r.Samples, detail)
+	}
+}
+
+// Run executes every check over the shards, in shard-index order. Pass one
+// read-only REPEATABLE READ tx per shard (see Snapshot).
+func Run(ctx context.Context, shards []store.Querier) ([]Result, error) {
+	var results []Result
+	for _, c := range Local {
+		r := Result{Check: c}
+		for i, q := range shards {
+			rows, err := q.Query(ctx, c.SQL)
+			if err != nil {
+				return nil, fmt.Errorf("invariant %d (%s) on shard %d: %w", c.Invariant, c.Name, i, err)
+			}
+			details, err := pgx.CollectRows(rows, pgx.RowTo[string])
+			if err != nil {
+				return nil, fmt.Errorf("invariant %d (%s) on shard %d: %w", c.Invariant, c.Name, i, err)
+			}
+			for _, d := range details {
+				r.add(fmt.Sprintf("shard %d: %s", i, d))
+			}
 		}
-		details, err := pgx.CollectRows(rows, pgx.RowTo[string])
-		if err != nil {
-			return nil, fmt.Errorf("invariant %d (%s): %w", c.Invariant, c.Name, err)
-		}
-		r := Result{Check: c, Violations: len(details)}
-		r.Samples = details[:min(len(details), maxSamples)]
 		results = append(results, r)
 	}
+	global, err := runGlobal(ctx, shards)
+	if err != nil {
+		return nil, err
+	}
+	results = append(results, global...)
+	slices.SortStableFunc(results, func(a, b Result) int { return a.Invariant - b.Invariant })
 	return results, nil
 }
 
-// Snapshot runs every check inside one read-only REPEATABLE READ tx.
-func Snapshot(ctx context.Context, db interface {
-	BeginTx(context.Context, pgx.TxOptions) (pgx.Tx, error)
-}) ([]Result, error) {
-	var results []Result
-	err := pgx.BeginTxFunc(ctx, db, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly},
-		func(tx pgx.Tx) (err error) {
-			results, err = Run(ctx, tx)
-			return err
-		})
-	return results, err
+// Snapshot reads every shard in its own read-only REPEATABLE READ tx and
+// runs all checks. Together the snapshots are consistent only while the
+// ledger is idle, so run it after the harness drains (A§9.6).
+func Snapshot(ctx context.Context, shards *store.Shards) ([]Result, error) {
+	var qs []store.Querier
+	for i := range shards.N() {
+		tx, err := shards.Pool(i).BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+		if err != nil {
+			return nil, fmt.Errorf("shard %d: %w", i, err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		qs = append(qs, tx)
+	}
+	return Run(ctx, qs)
 }
 
 // Clean reports whether no check found a violation.

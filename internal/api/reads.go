@@ -21,7 +21,7 @@ func (s *Service) GetBalanceAt(ctx context.Context, req *connect.Request[ledgerv
 	if req.Msg.GetAt() == nil {
 		return nil, ErrInvalidRequest("at is required.")
 	}
-	posted, err := s.ledger.GetBalanceAt(ctx, id, req.Msg.GetAt().AsTime())
+	posted, err := s.engine.GetBalanceAt(ctx, id, req.Msg.GetAt().AsTime())
 	if err != nil {
 		return nil, toConnect(err)
 	}
@@ -40,7 +40,7 @@ func (s *Service) ListEntries(ctx context.Context, req *connect.Request[ledgerv1
 			return nil, ErrInvalidRequest("cursor is not valid.")
 		}
 	}
-	entries, more, err := s.ledger.ListEntries(ctx, id,
+	entries, more, err := s.engine.ListEntries(ctx, id,
 		optionalTimestamp(req.Msg.GetFrom()), optionalTimestamp(req.Msg.GetTo()), after, int(req.Msg.GetLimit()))
 	if err != nil {
 		return nil, toConnect(err)
@@ -80,7 +80,7 @@ func (s *Service) ListReceivables(ctx context.Context, req *connect.Request[ledg
 			return nil, ErrInvalidRequest("min_age must not be negative.")
 		}
 	}
-	rs, more, err := s.ledger.ListReceivables(ctx, minAge, after, int(req.Msg.GetLimit()))
+	rs, more, err := s.engine.ListReceivables(ctx, minAge, after, int(req.Msg.GetLimit()))
 	if err != nil {
 		return nil, toConnect(err)
 	}

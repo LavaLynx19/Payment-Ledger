@@ -7,6 +7,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+
+	"payment-ledger/internal/shard"
 )
 
 // LockTransfer reads a Transfer and locks it until tx ends, so two
@@ -74,7 +76,7 @@ func PendingInto(ctx context.Context, q Querier, accountID uuid.UUID) (int64, er
 // EnsureReceivableAccount returns walletID's receivable System account,
 // creating it on first use. It's debit-normal: posted is what the debtor owes.
 func EnsureReceivableAccount(ctx context.Context, tx pgx.Tx, walletID uuid.UUID) (Account, error) {
-	id, err := uuid.NewV7()
+	id, err := shard.Like(walletID) // a receivable lives on its debtor's shard
 	if err != nil {
 		return Account{}, err
 	}
