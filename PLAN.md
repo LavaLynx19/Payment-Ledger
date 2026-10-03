@@ -67,6 +67,16 @@ This plan covers task order, verification, and commit sequence. Requirements are
 ### Phase 6 — Writeup (§P6)
 - [x] P6.1 Interview writeup via `/docs` (design, rung results, Decision Log walkthrough) → §P6
 
+### Phase 7 — Future work (§P7)
+Nothing here is scheduled. Each item starts a new DESIGN/ARCH pass when picked up.
+- [>] P7.1 Deployment-scale experiment: shards on separate hosts, so sharding is measured as scale-out, not coordination cost → defer until: a second machine or cloud budget is available
+- [>] P7.2 Diagnose TigerBeetle tail latency (p95/p99 2–3× the saga's at 2,000/s) → defer until: P7.3's load setup exists, so client limits are ruled out
+- [>] P7.3 Find TigerBeetle's real capacity ceiling with more than one load generator → defer until: P7.1 or a multi-container k6 setup
+- [>] P7.4 Repeat key runs 3+ times and report p99 as a range → defer until: any rerun of the Rung 4 matrix
+- [>] P7.5 Load-test a long worker outage (System-initiated Holds never expire) → defer until: Decision Log entry is revisited or an outage scenario is added to the harness
+- [>] P7.6 Age keys across shards in `AGE_KEYS` (today ~half the keys on 2 shards) → defer until: any change to purge or the key layout
+- [>] P7.7 Single-shard tests fall back to `SHARD_URLS` when `DATABASE_URL` is unset, so they can't skip silently → defer until: next CODE session touching tests
+
 ---
 
 ## Project structure
@@ -134,6 +144,18 @@ Design: A§9. Order: infrastructure (P5.2) → sharded Postgres (P5.3–P5.8) �
 
 ## §P6 — Writeup
 **Verify:** each Decision Log entry is walked through with the evidence from its rung.
+
+## §P7 — Future work
+Starting points for each P7 item. Evidence lives in `RESULTS.md` and `retros/rung-4.md`.
+- **P7.1 Deployment scale.** On one machine both shards share CPU, so 2PC measured 0.5× and saga 0.75× of one shard (RESULTS.md → Capacity). Put each shard, api and worker on its own host, rerun `harness/k6/saturate.js` per backend, and compare against those ratios. Resharding stays out of scope (README) unless this changes it.
+- **P7.2 TigerBeetle tail.** At 2,000/s TigerBeetle's p50 is the lowest (1.44–1.53 ms), but p95/p99 reach 9.4–12.5 / 17.5–26.9 ms (RESULTS.md → Latency, observation 6). First hypotheses: client-side request batching, and the Go client's single connection per api process.
+- **P7.3 TigerBeetle ceiling.** Saturation reached 5,934/s with 0.9–1.1% dropped at 5–6k/s, and one k6 container may be the limit. Split load across 2+ k6 containers before claiming a ratio above ≥ 1.25×.
+- **P7.4 Run-to-run noise.** The same one-shard run measured p99 4.3 ms and 11.3 ms an hour apart. Capacity ratios are stable; single p99 values are not.
+- **P7.5 Worker outage.** Reversal and receivable Holds never expire (Decision Log), so a worker down for minutes leaves debtor funds held. Add a harness fault that stops the worker for a set period, then check that corrections complete and the checker stays clean.
+- **P7.6 Key ageing.** `harness/faults/age-keys.sh` joins keys to Transfers on the same shard only, so purge is under-exercised with 2 shards.
+- **P7.7 Test env.** Single-shard integration tests read `DATABASE_URL`, two-shard tests `SHARD_URLS`. With only `SHARD_URLS` set, `go test` prints `ok` while ~48 tests skip. Until fixed, run with both set and check `-v` PASS/SKIP counts (full coverage: 65 PASS).
+
+**Resuming after cleanup (2026-10-03):** the payment-ledger containers, volumes, app images and `golang:1.27` were removed. `harness/run.sh` rebuilds the images and recreates fresh volumes on its first run. The TigerBeetle-tagged tests need `golang:1.27`, which is downloaded again on demand.
 
 ## Commit sequence
 Each phase gets a feature branch (`p0-scaffold`, `p1-rung1`, `p2-features`, `p3-rung2`, …). There's one commit per checklist item, with a message of the form `P1.3: naive accept path`. P1.8 and P1.9 are separate commits, so the racy version stays in history on purpose. Branches merge to `main` only after that phase's verification passes. Commits and merges happen only when you ask.
