@@ -65,7 +65,7 @@ This plan covers task order, verification, and commit sequence. Requirements are
 - [x] P5.12 Measure 2PC vs saga vs TigerBeetle (baseline, hot runs, fault matrix incl. toxiproxy), `retros/rung-4.md` → §P5
 
 ### Phase 6 — Writeup (§P6)
-- [>] P6.1 Interview writeup via `/docs` (design, rung results, Decision Log walkthrough) → defer until: Rung 4 passes
+- [x] P6.1 Interview writeup via `/docs` (design, rung results, Decision Log walkthrough) → §P6
 
 ---
 
